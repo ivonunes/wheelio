@@ -3,11 +3,12 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace g923bridge {
+namespace wheelio_bridge {
 
-constexpr std::uint32_t kProtocolMagic = 0x47463233;  // "GF23"
+constexpr std::uint32_t kProtocolMagic = 0x4646424D;  // "FFBM"
 constexpr std::uint16_t kProtocolVersion = 1;
 constexpr std::uint16_t kDefaultPort = 18423;
+constexpr std::uint32_t kMaxPayloadSize = 4096;
 
 enum class MessageType : std::uint16_t {
     hello = 1,
@@ -18,6 +19,11 @@ enum class MessageType : std::uint16_t {
     set_led_pattern = 13,
 };
 
+// Wire format is little-endian. Both ends are little-endian today (Apple
+// Silicon / Intel macOS, and the mingw x86_64 Windows DLL), so the packed
+// structs below are exchanged byte-for-byte without conversion. If a
+// big-endian peer is ever introduced, add explicit byte-swapping at the
+// socket boundary.
 #pragma pack(push, 1)
 
 struct MessageHeader {
@@ -75,10 +81,12 @@ struct LedPatternPayload {
 static_assert(sizeof(MessageHeader) == 12, "Unexpected MessageHeader size");
 static_assert(sizeof(HelloPayload) == 68, "Unexpected HelloPayload size");
 static_assert(sizeof(HelloAckPayload) == 68, "Unexpected HelloAckPayload size");
+static_assert(sizeof(WheelStatePayload) == 21, "Unexpected WheelStatePayload size");
+static_assert(sizeof(LedPatternPayload) == 1, "Unexpected LedPatternPayload size");
 
 template <typename T>
 constexpr std::size_t payload_size() {
     return sizeof(T);
 }
 
-}  // namespace g923bridge
+}  // namespace wheelio_bridge

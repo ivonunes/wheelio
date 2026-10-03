@@ -1,7 +1,9 @@
 #include "device.hpp"
 #include "constants.hpp"
+#include "wheel_registry.hpp"
 #include "utilities.hpp"
 #include <algorithm>
+#include <vector>
 #include <IOKit/hid/IOHIDKeys.h>
 
 DeviceManager::DeviceManager() : hid_manager_(nullptr) {
@@ -21,60 +23,87 @@ bool DeviceManager::initialize_hid_manager() {
         return false;
     }
     
-    CFMutableDictionaryRef matching_dict = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    
-    if (matching_dict) {
-        int vendor_id = static_cast<int>(G923_VENDOR_ID);
-        CFNumberRef vendor_id_ref = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vendor_id);
-        CFDictionarySetValue(matching_dict, CFSTR(kIOHIDVendorIDKey), vendor_id_ref);
-        CFRelease(vendor_id_ref);
-        
-        int product_id = static_cast<int>(G923_PRODUCT_ID);
-        CFNumberRef product_id_ref = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &product_id);
-        CFDictionarySetValue(matching_dict, CFSTR(kIOHIDProductIDKey), product_id_ref);
-        CFRelease(product_id_ref);
-        
-        IOHIDManagerSetDeviceMatching(hid_manager_, matching_dict);
-        CFRelease(matching_dict);
+    // Match every supported manufacturer's vendor ID (one matching dict each),
+    // so adding a manufacturer in the registry automatically widens enumeration.
+    const std::vector<std::uint32_t> vendor_ids = wheel_registry::supported_vendor_ids();
+    CFMutableArrayRef matching_array =
+        CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+
+    if (matching_array) {
+        for (std::uint32_t vendor : vendor_ids) {
+            CFMutableDictionaryRef matching_dict = CFDictionaryCreateMutable(
+                kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            if (!matching_dict) {
+                continue;
+            }
+            int vendor_id = static_cast<int>(vendor);
+            CFNumberRef vendor_id_ref = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vendor_id);
+            CFDictionarySetValue(matching_dict, CFSTR(kIOHIDVendorIDKey), vendor_id_ref);
+            CFRelease(vendor_id_ref);
+            CFArrayAppendValue(matching_array, matching_dict);
+            CFRelease(matching_dict);
+        }
+
+        IOHIDManagerSetDeviceMatchingMultiple(hid_manager_, matching_array);
+        CFRelease(matching_array);
     } else {
         IOHIDManagerSetDeviceMatching(hid_manager_, nullptr);
     }
-    
+
+    // Hotplug detection: deliver attach/removal callbacks on the main run loop.
+    // The callbacks only signal a change (they do no HID work), so sharing the
+    // manager with device enumeration on the server thread is safe.
+    IOHIDManagerRegisterDeviceMatchingCallback(hid_manager_, &DeviceManager::handle_device_matched, this);
+    IOHIDManagerRegisterDeviceRemovalCallback(hid_manager_, &DeviceManager::handle_device_removed, this);
+    IOHIDManagerScheduleWithRunLoop(hid_manager_, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+
     IOReturn result = IOHIDManagerOpen(hid_manager_, kIOHIDOptionsTypeNone);
-    
+
     if (!ErrorHandler::check_io_result("IOHIDManagerOpen", result)) {
         cleanup_hid_manager();
         return false;
     }
-    
+
     return true;
 }
 
 void DeviceManager::cleanup_hid_manager() {
     if (hid_manager_) {
         Logger::debug("Cleaning up HID manager");
-        
-        // Schedule with run loop to ensure proper cleanup
-        IOHIDManagerScheduleWithRunLoop(hid_manager_, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
-        
-        // Close the manager
+
+        IOHIDManagerUnscheduleFromRunLoop(hid_manager_, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+
         IOReturn result = IOHIDManagerClose(hid_manager_, kIOHIDManagerOptionNone);
         if (result != kIOReturnSuccess) {
             Logger::warning("Failed to close HID manager: " + std::to_string(result));
         }
-        
-        // Unschedule from run loop
-        IOHIDManagerUnscheduleFromRunLoop(hid_manager_, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
-        
-        // Release the manager
+
         CFRelease(hid_manager_);
         hid_manager_ = nullptr;
-        
-        // Give system time to fully release resources
-        usleep(100 * 1000);  // 100ms
-        
+
         Logger::debug("HID manager cleanup complete");
+    }
+}
+
+void DeviceManager::set_device_change_handler(std::function<void()> handler) {
+    device_change_handler_ = std::move(handler);
+}
+
+void DeviceManager::notify_device_change() {
+    if (device_change_handler_) {
+        device_change_handler_();
+    }
+}
+
+void DeviceManager::handle_device_matched(void* context, IOReturn, void*, IOHIDDeviceRef) {
+    if (auto* self = static_cast<DeviceManager*>(context)) {
+        self->notify_device_change();
+    }
+}
+
+void DeviceManager::handle_device_removed(void* context, IOReturn, void*, IOHIDDeviceRef) {
+    if (auto* self = static_cast<DeviceManager*>(context)) {
+        self->notify_device_change();
     }
 }
 
@@ -104,7 +133,7 @@ std::vector<HidDevice> DeviceManager::list_all_devices() {
         
         device_id_t vendor_id = get_device_property_number(device, CFSTR(kIOHIDVendorIDKey));
         device_id_t product_id = get_device_property_number(device, CFSTR(kIOHIDProductIDKey));
-        device_id_t device_id = (product_id << 16) | vendor_id;
+        device_id_t device_id = make_device_id(vendor_id, product_id);
         
         devices.emplace_back(vendor_id, product_id, device_id, device);
     }
@@ -122,11 +151,10 @@ std::vector<HidDevice> DeviceManager::find_known_wheels() {
     
     std::copy_if(all_devices.begin(), all_devices.end(), std::back_inserter(wheels),
                     [](const HidDevice& device) {
-                        return std::find(KNOWN_WHEEL_IDS.begin(), KNOWN_WHEEL_IDS.end(), 
-                                    device.device_id) != KNOWN_WHEEL_IDS.end();
+                        return device.is_known_wheel();
                     });
     
-    Logger::info("Found " + std::to_string(wheels.size()) + " known wheels");
+    Logger::info("Found " + std::to_string(wheels.size()) + " known Logitech wheels");
     return wheels;
 }
 
@@ -140,14 +168,6 @@ device_id_t DeviceManager::get_device_property_number(hid_device_t* device, CFSt
     }
     
     return 0;
-}
-
-CFStringRef DeviceManager::get_device_property_string(hid_device_t* device, CFStringRef property) {
-    CFTypeRef data = IOHIDDeviceGetProperty(device, property);
-    if (data && CFGetTypeID(data) == CFStringGetTypeID()) {
-        return CFStringCreateCopy(kCFAllocatorDefault, static_cast<CFStringRef>(data));
-    }
-    return nullptr;
 }
 
 void DeviceManager::copy_devices_to_array(const void* value, void* context) {
@@ -173,7 +193,7 @@ bool HidDeviceInterface::open() {
         return false;
     }
     
-    IOReturn result = IOHIDDeviceOpen(device_.hid_device, kIOHIDOptionsTypeNone);
+    IOReturn result = IOHIDDeviceOpen(device_.raw_device(), kIOHIDOptionsTypeNone);
 
     if (ErrorHandler::check_io_result("IOHIDDeviceOpen", result)) {
         is_open_ = true;
@@ -190,11 +210,10 @@ bool HidDeviceInterface::close() {
     }
     
     Logger::debug("Closing device " + utils::format_device_id(device_.device_id));
-    
-    // Ensure all pending operations are completed
-    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false);
-    
-    IOReturn result = IOHIDDeviceClose(device_.hid_device, 0);
+
+    // IOHIDDeviceClose is synchronous for our SetReport-only usage; there are
+    // no queued input callbacks to drain.
+    IOReturn result = IOHIDDeviceClose(device_.raw_device(), 0);
     bool success = ErrorHandler::check_io_result("IOHIDDeviceClose", result);
     
     if (success) {
@@ -212,13 +231,15 @@ bool HidDeviceInterface::send_command(const Command& command) {
         Logger::error("Cannot send command: device not open");
         return false;
     }
+
+    const std::size_t report_length = std::min(command.size(), device_.output_report_length());
     
     IOReturn result = IOHIDDeviceSetReport(
-        device_.hid_device,
+        device_.raw_device(),
         kIOHIDReportTypeOutput,
-        time(nullptr),
+        static_cast<CFIndex>(device_.output_report_id()),
         command.raw(),
-        command.size()
+        report_length
     );
     
     return ErrorHandler::check_io_result("IOHIDDeviceSetReport", result);

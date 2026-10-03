@@ -31,19 +31,19 @@ void Logger::log(LogLevel level, const std::string& message) {
     
     switch (level) {
         case LogLevel::Debug:
-            prefix = "g923mac::debug";
+            prefix = "wheelio::debug";
             color_code = 37; // White
             break;
         case LogLevel::Info:
-            prefix = "g923mac::info";
+            prefix = "wheelio::info";
             color_code = 32; // Green
             break;
         case LogLevel::Warning:
-            prefix = "g923mac::warning";
+            prefix = "wheelio::warning";
             color_code = 33; // Yellow
             break;
         case LogLevel::Error:
-            prefix = "g923mac::error";
+            prefix = "wheelio::error";
             color_code = 31; // Red
             break;
     }
@@ -52,7 +52,7 @@ void Logger::log(LogLevel level, const std::string& message) {
 }
 
 void Logger::print_with_color(const std::string& prefix, const std::string& message, int color_code) {
-    printf("\\033[1;%dm=== %s \\033[0m: %s\\n", color_code, prefix.c_str(), message.c_str());
+    printf("\033[1;%dm=== %s \033[0m: %s\n", color_code, prefix.c_str(), message.c_str());
 }
 
 bool ErrorHandler::check_io_result(const std::string& operation, IOReturn result) {

@@ -1,0 +1,57 @@
+name: CI
+
+# Pull requests to main, and every release (which runs these same checks
+# before it publishes). Pushes to main don't run it on their own.
+on:
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    # The app targets macOS 15, which needs the Xcode on macOS 15 runners.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install tools
+        run: brew install xcodegen mingw-w64   # cmake is preinstalled on the runner
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d  # stable
+
+      - name: Build & test the VR streamer
+        working-directory: streamer
+        run: |
+          cargo build --release
+          cargo test --release
+
+      - name: Build & test macOS app
+        run: |
+          xcodegen generate
+          xcodebuild -project Wheelio.xcodeproj -scheme Wheelio \
+            -configuration Debug -derivedDataPath build \
+            -destination 'platform=macOS' \
+            test
+
+      - name: C++ unit + protocol tests
+        run: |
+          cmake -S . -B build-tests -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-tests
+          ctest --test-dir build-tests --output-on-failure
+
+      - name: Cross-build Windows proxy and OpenXR runtime
+        run: |
+          cmake -S . -B build-windows -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_WINDOWS_PROXY=ON \
+            -DCMAKE_TOOLCHAIN_FILE=bridge/windows/toolchains/x86_64-w64-mingw32.cmake
+          cmake --build build-windows --target wheelio_dinput8 wheelio_openxr_runtime wheelio_xr_smoke
+          cmake -S . -B build-windows-x86 -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_WINDOWS_PROXY=ON \
+            -DCMAKE_TOOLCHAIN_FILE=bridge/windows/toolchains/i686-w64-mingw32.cmake
+          cmake --build build-windows-x86 --target wheelio_dinput8

@@ -3,8 +3,22 @@
 
 # Build output directories
 /build/
+/build-release/
 /build-windows/
+/build-windows-release/
+/build-windows-x86/
+/build-windows-x86-release/
+/build-windows-release-x86/
+/build-tests/
 /cmake-build-*/
+/dist/
+
+# Generated Xcode project (regenerate from project.yml via xcodegen)
+/Wheelio.xcodeproj/
+/bridge/macos/Wheelio-Info.plist
+
+# Xcode build/derived data
+/DerivedData/
 
 # In-source CMake/Ninja artifacts
 /CMakeCache.txt
@@ -15,5 +29,6 @@
 
 # Local runtime/debug logs
 /log.txt
+/wheelio_proxy.log
 /g923mac_proxy.log
 /g923ffb_proxy.log

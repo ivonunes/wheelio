@@ -1,0 +1,121 @@
+# XcodeGen spec for the Wheelio Swift UI app.
+#
+# Regenerate the .xcodeproj with:  xcodegen generate   (or scripts/gen-xcode.sh)
+#
+# This builds ONLY the macOS UI app. The C++ engine sources are compiled
+# directly into this target; the Windows dinput8.dll stays on CMake (it shares
+# bridge/common + bridge/include with this target via the same source files).
+name: Wheelio
+
+options:
+  bundleIdPrefix: uk.ivonunes
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: false
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+    CLANG_CXX_LIBRARY: "libc++"
+    GCC_ENABLE_CPP_EXCEPTIONS: NO    # engine builds -fno-exceptions
+    GCC_ENABLE_CPP_RTTI: NO          # engine builds -fno-rtti
+    GCC_TREAT_WARNINGS_AS_ERRORS: NO
+    ENABLE_USER_SCRIPT_SANDBOXING: NO  # the proxy-bundling phase reads/builds outside DerivedData
+    # Ad-hoc sign local builds properly. A build with CODE_SIGNING_ALLOWED=NO is
+    # only "linker-signed", and macOS then refuses the System Audio Recording
+    # permission without ever prompting, so the headset gets no game audio.
+    # release.sh re-signs with a Developer ID when one is configured.
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    # Apple silicon only: the bundled VR streamer is an arm64 binary.
+    ARCHS: arm64
+
+targets:
+  Wheelio:
+    type: application
+    platform: macOS
+    sources:
+      # Swift UI
+      - path: app
+      # C shim (the UI <-> engine boundary)
+      - path: bridge/macos/wheelio_bridge_c.h
+      - path: bridge/macos/wheelio_bridge_c.cpp
+      # macOS engine glue (socket server + wheel logic; header is in bridge/include)
+      - path: bridge/macos/bridge_server.cpp
+      # VR frame preview: reads what the OpenXR runtime publishes from the bottle
+      - path: bridge/macos/vr_frame_reader.cpp
+      # Wheel core (IOKit HID)
+      - path: src
+      - path: include
+      # Shared protocol + effect mapping (also compiled into the Windows DLL)
+      - path: bridge/common
+      - path: bridge/include
+      # App icon
+      - path: bridge/macos/Resources/Wheelio.icns
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_NAME: Wheelio
+        PRODUCT_BUNDLE_IDENTIFIER: uk.ivonunes.wheelio
+        MARKETING_VERSION: "2.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_OBJC_BRIDGING_HEADER: app/Wheelio-Bridging-Header.h
+        CODE_SIGN_ENTITLEMENTS: app/Wheelio.entitlements
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/include"
+          - "$(SRCROOT)/bridge/include"
+          - "$(SRCROOT)/bridge/macos"
+    info:
+      path: bridge/macos/Wheelio-Info.plist
+      properties:
+        LSUIElement: true            # menu-bar accessory, no Dock icon
+        LSMultipleInstancesProhibited: true  # one copy owns the wheel; see SingleInstance.swift
+        CFBundleIconFile: Wheelio
+        NSPrincipalClass: NSApplication
+        # Driven by build settings so release.sh / CI can stamp the real version.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # The VR streamer taps system audio to send the game's sound to the headset.
+        NSAudioCaptureUsageDescription: "Wheelio sends the game's sound to your VR headset."
+        # macOS asks this for any audio input, including the system audio tap. Wheelio never records a microphone.
+        NSMicrophoneUsageDescription: "Wheelio captures the game's sound for your VR headset. It does not record your microphone."
+    dependencies:
+      - sdk: IOKit.framework
+      - sdk: CoreFoundation.framework
+      - sdk: AppKit.framework
+    postBuildScripts:
+      # Bundle the Windows proxy dinput8.dll into the app's Resources so the
+      # in-app "Set Up a Game" installer works in any build (Debug included),
+      # not just release.sh packaging. Best-effort: copies a prebuilt DLL if
+      # present, builds it once if mingw-w64 is available, and otherwise warns
+      # without failing the build.
+      - name: Bundle proxy DLL
+        script: |
+          "${SRCROOT}/scripts/bundle-proxy-dll.sh"
+      # Bundle the OpenXR runtime and the VR streamer (Rust) the same way.
+      - name: Bundle OpenXR runtime
+        script: |
+          "${SRCROOT}/scripts/bundle-openxr-runtime.sh"
+      - name: Bundle streamer
+        script: |
+          "${SRCROOT}/scripts/bundle-streamer.sh"
+    scheme:
+      testTargets:
+        - WheelioTests
+
+  # Logic tests for the pure Swift helpers (compiles the sources directly, no
+  # app host) — run with: xcodebuild test -scheme Wheelio -destination 'platform=macOS'
+  WheelioTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - app/CrossOverSupport.swift
+      - app/UpdateChecker.swift
+      - tests/swift
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        PRODUCT_BUNDLE_IDENTIFIER: uk.ivonunes.wheelio.tests
+        GENERATE_INFOPLIST_FILE: YES

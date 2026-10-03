@@ -1,0 +1,38 @@
+[package]
+name = "wheelio-streamer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# ALVR pinned to the release the Meta store client is built from. Bumping this
+# means checking the client version on the headset first: ALVR refuses to
+# stream between mismatched versions.
+alvr_server_core = { git = "https://github.com/alvr-org/ALVR.git", rev = "a9f6542fa507a841f40ab4f3fcb531427cd02550" }
+alvr_common = { git = "https://github.com/alvr-org/ALVR.git", rev = "a9f6542fa507a841f40ab4f3fcb531427cd02550" }
+alvr_filesystem = { git = "https://github.com/alvr-org/ALVR.git", rev = "a9f6542fa507a841f40ab4f3fcb531427cd02550" }
+alvr_session = { git = "https://github.com/alvr-org/ALVR.git", rev = "a9f6542fa507a841f40ab4f3fcb531427cd02550" }
+alvr_packets = { git = "https://github.com/alvr-org/ALVR.git", rev = "a9f6542fa507a841f40ab4f3fcb531427cd02550" }
+objc2-video-toolbox = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-core-video = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2 = "0.6"
+serde_json = "1"
+glob = "0.3"
+memmap2 = "0.9"
+dirs = "6"
+alvr_server_io = { git = "https://github.com/alvr-org/ALVR.git", rev = "a9f6542fa507a841f40ab4f3fcb531427cd02550", version = "20.14.1" }
+parking_lot = "0.12"
+objc2-core-audio = "0.3.2"
+objc2-foundation = "0.3.2"
+cpal = "0.15"
+libc = "0.2"
+
+[profile.release]
+debug = "limited"
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-tungstenite = "0.20"

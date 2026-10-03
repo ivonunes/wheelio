@@ -1,11 +1,16 @@
 #include "bridge_server.hpp"
+#include "wheel_registry.hpp"
 #include "utilities.hpp"
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <os/log.h>
+#include <pthread.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -13,7 +18,31 @@
 
 namespace {
 
-bool recv_exact(int fd, void* buffer, std::size_t size) {
+// Wheelio's bridge diagnostics, read with:
+//   log show --last 1h --predicate 'subsystem == "uk.ivonunes.wheelio" && category == "bridge"'
+os_log_t bridge_log() {
+    static os_log_t log = os_log_create("uk.ivonunes.wheelio", "bridge");
+    return log;
+}
+
+// After a wheel is hot-plugged, give macOS and the wheel's firmware time to
+// finish their own power-on initialization before we open and calibrate it.
+// Taking over mid-initialization can leave the wheel in a state other apps
+// (e.g. CrossOver) then fail to detect. See process_pending_device_change.
+constexpr std::chrono::milliseconds kHotplugConnectGrace{5000};
+
+// A socket timeout (SO_RCVTIMEO/SO_SNDTIMEO) or signal interrupt is not a
+// failure — the peer may just be idle between messages. We keep waiting unless
+// a shutdown was requested, so the configured timeout only bounds how quickly
+// the session notices stop().
+bool retry_after_transient_error(const std::atomic<bool>& stop) {
+    if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+        return false;
+    }
+    return !stop.load();
+}
+
+bool recv_exact(int fd, void* buffer, std::size_t size, const std::atomic<bool>& stop) {
     auto* out = static_cast<std::uint8_t*>(buffer);
     std::size_t received = 0;
 
@@ -23,7 +52,7 @@ bool recv_exact(int fd, void* buffer, std::size_t size) {
             return false;
         }
         if (chunk < 0) {
-            if (errno == EINTR) {
+            if (retry_after_transient_error(stop)) {
                 continue;
             }
             return false;
@@ -34,14 +63,17 @@ bool recv_exact(int fd, void* buffer, std::size_t size) {
     return true;
 }
 
-bool send_exact(int fd, const void* buffer, std::size_t size) {
+bool send_exact(int fd, const void* buffer, std::size_t size, const std::atomic<bool>& stop) {
     const auto* data = static_cast<const std::uint8_t*>(buffer);
     std::size_t sent = 0;
 
     while (sent < size) {
         const ssize_t chunk = send(fd, data + sent, size - sent, 0);
+        if (chunk == 0) {
+            return false;
+        }
         if (chunk < 0) {
-            if (errno == EINTR) {
+            if (retry_after_transient_error(stop)) {
                 continue;
             }
             return false;
@@ -52,72 +84,43 @@ bool send_exact(int fd, const void* buffer, std::size_t size) {
     return true;
 }
 
+bool discard_exact(int fd, std::size_t size, const std::atomic<bool>& stop) {
+    std::array<std::uint8_t, 256> discard{};
+    std::size_t remaining = size;
+    while (remaining > 0) {
+        const std::size_t chunk = std::min(remaining, discard.size());
+        if (!recv_exact(fd, discard.data(), chunk, stop)) {
+            return false;
+        }
+        remaining -= chunk;
+    }
+    return true;
+}
+
+void configure_client_socket(int fd) {
+    timeval client_timeout{};
+    client_timeout.tv_sec = 1;
+    client_timeout.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &client_timeout, sizeof(client_timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &client_timeout, sizeof(client_timeout));
+
+    // Disable Nagle's algorithm: force-feedback updates are tiny, latency-critical
+    // packets, and Nagle would coalesce/hold them (interacting with delayed-ACK
+    // for up to ~40ms of added lag). Send each update immediately.
+    int nodelay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+#ifdef SO_NOSIGPIPE
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+#endif
+}
+
 void close_if_open(int& fd) {
     if (fd >= 0) {
         close(fd);
         fd = -1;
     }
-}
-
-int map_constant_magnitude_to_level(std::int16_t signed_magnitude) {
-    constexpr int kNominalForceMax = 10000;
-    constexpr int kInputDeadzone = 2;
-    constexpr float kLowRangeReference = 64.0f;
-    constexpr float kLowRangeExponent = 0.60f;
-    constexpr float kLowRangeMaxOutput = 90.0f;
-    constexpr float kHighRangeGain = 2.0f;
-
-    const int magnitude = std::abs(static_cast<int>(signed_magnitude));
-    if (magnitude <= kInputDeadzone) {
-        return 0;
-    }
-
-    const float low_normalized = std::min(
-        1.0f, static_cast<float>(magnitude - kInputDeadzone) / (kLowRangeReference - static_cast<float>(kInputDeadzone)));
-    const float low_curve = std::pow(low_normalized, kLowRangeExponent) * kLowRangeMaxOutput;
-
-    const float high_normalized = std::min(1.0f, static_cast<float>(magnitude) / static_cast<float>(kNominalForceMax));
-    const float high_curve = std::sqrt(high_normalized) * 127.0f * kHighRangeGain;
-
-    int level = static_cast<int>(std::lround(std::max(low_curve, high_curve)));
-    level = std::min(127, std::max(0, level));
-    if (signed_magnitude < 0) {
-        level = -level;
-    }
-    return level;
-}
-
-int apply_constant_slew_limiter(int target_level, bool have_last_level, int last_level) {
-    if (!have_last_level) {
-        return target_level;
-    }
-
-    constexpr int kMaxStepSameDirection = 24;
-    constexpr int kMaxStepSignFlip = 10;
-    constexpr int kMicroFlipGate = 8;
-
-    if (target_level != 0 && last_level != 0 &&
-        (target_level * last_level) < 0 &&
-        std::abs(target_level) <= kMicroFlipGate &&
-        std::abs(last_level) <= kMicroFlipGate) {
-        return 0;
-    }
-
-    int limited = target_level;
-    const int max_step =
-        ((target_level != 0 && last_level != 0 && (target_level * last_level) < 0) ? kMaxStepSignFlip : kMaxStepSameDirection);
-
-    if (limited > last_level + max_step) {
-        limited = last_level + max_step;
-    } else if (limited < last_level - max_step) {
-        limited = last_level - max_step;
-    }
-
-    if (std::abs(limited) <= 1) {
-        limited = 0;
-    }
-
-    return limited;
 }
 
 }  // namespace
@@ -126,15 +129,58 @@ BridgeServer::BridgeServer(std::uint16_t port)
     : port_(port), stop_requested_(false), listen_fd_(-1), device_manager_() {
     status_.port = port_;
     status_.wheel_name = "Starting wheel service...";
+
+    // Hotplug: the handler runs on the main run loop, so just record that a
+    // change happened (no HID work here). The server thread debounces and
+    // reconciles once changes settle.
+    device_manager_.set_device_change_handler([this]() {
+        device_change_seq_.fetch_add(1, std::memory_order_relaxed);
+    });
 }
 
 BridgeServer::~BridgeServer() {
     stop();
 }
 
+bool BridgeServer::open_listen_socket() {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port_);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+        listen(fd, 1) != 0) {
+        close(fd);
+        return false;
+    }
+
+    listen_fd_ = fd;
+    return true;
+}
+
 bool BridgeServer::start() {
     if (server_thread_.joinable()) {
         return true;
+    }
+
+    // Create the listening socket synchronously here, before the worker thread
+    // exists, so stop() always observes a valid (or -1) listen_fd_ and there is
+    // no race over who creates it.
+    if (!open_listen_socket()) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        status_.listening = true;
     }
 
     stop_requested_.store(false);
@@ -145,6 +191,8 @@ bool BridgeServer::start() {
 void BridgeServer::stop() {
     stop_requested_.store(true);
 
+    // Interrupt a blocking select()/accept() on the worker thread. The worker
+    // only ever reads listen_fd_; this thread closes it after the join.
     if (listen_fd_ >= 0) {
         shutdown(listen_fd_, SHUT_RDWR);
     }
@@ -152,6 +200,8 @@ void BridgeServer::stop() {
     if (server_thread_.joinable()) {
         server_thread_.join();
     }
+
+    close_if_open(listen_fd_);
 
     std::lock_guard<std::mutex> lock(mutex_);
     status_.listening = false;
@@ -165,9 +215,140 @@ bool BridgeServer::reconnect_wheel() {
     return complete_wheel_connect_cycle(true);
 }
 
-BridgeServer::Status BridgeServer::status() const {
+// The tuning setters just store the value; each driver notices the change on the
+// next apply_state and re-applies, so a tweak takes effect on the next packet.
+void BridgeServer::set_force_gain(double gain) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return status_;
+    force_gain_ = std::max(0.0, std::min(2.0, gain));
+}
+
+void BridgeServer::set_spring_gain(double gain) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    spring_gain_ = std::max(0.0, std::min(2.0, gain));
+}
+
+void BridgeServer::set_damper_gain(double gain) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    damper_gain_ = std::max(0.0, std::min(2.0, gain));
+}
+
+void BridgeServer::set_smoothing(double amount) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    smoothing_ = std::max(0.0, std::min(1.0, amount));
+}
+
+void BridgeServer::set_min_force(double fraction) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    min_force_ = std::max(0.0, std::min(0.5, fraction));
+}
+
+void BridgeServer::run_self_test() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (wheels_.empty() || wheel_operation_in_progress_) {
+        return;
+    }
+
+    for (auto& wheel : wheels_) {
+        if (wheel && wheel->is_initialized()) {
+            wheel->self_test();
+        }
+    }
+}
+
+void BridgeServer::handle_device_change() {
+    bool have_wheel = false;
+    std::vector<hid_device_t*> connected_devices;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (wheel_operation_in_progress_) {
+            return;
+        }
+        have_wheel = !wheels_.empty();
+        for (const auto& wheel : wheels_) {
+            if (wheel) {
+                connected_devices.push_back(wheel->device().raw_device());
+            }
+        }
+    }
+
+    // A matching device was attached or removed; reconcile our connection state.
+    const auto present = device_manager_.find_known_wheels();
+    if (present.empty()) {
+        if (have_wheel) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            disconnect_wheel_locked();
+            status_.wheel_name = "Wheel disconnected";
+        }
+        return;
+    }
+
+    if (!have_wheel) {
+        complete_wheel_connect_cycle(false);
+        return;
+    }
+
+    const bool all_connected_interfaces_still_present = std::all_of(
+        connected_devices.begin(),
+        connected_devices.end(),
+        [&present](hid_device_t* connected_device) {
+            return connected_device && std::any_of(
+                present.begin(),
+                present.end(),
+                [connected_device](const HidDevice& device) {
+                    return device.raw_device() == connected_device;
+                });
+        });
+
+    if (!all_connected_interfaces_still_present) {
+        complete_wheel_connect_cycle(true);
+    }
+}
+
+void BridgeServer::process_pending_device_change() {
+    const std::uint64_t change_seq = device_change_seq_.load(std::memory_order_relaxed);
+    if (change_seq == handled_change_seq_) {
+        return;
+    }
+
+    if (change_seq != last_seen_change_seq_) {
+        // New device events are still arriving; note them (and when they began)
+        // and wait for the bus to settle before reconciling.
+        last_seen_change_seq_ = change_seq;
+        device_change_observed_at_ = std::chrono::steady_clock::now();
+        return;
+    }
+
+    // The change sequence has been quiet for an iteration. When this is a fresh
+    // connect (we currently hold no wheel), hold off a little longer: the moment
+    // a wheel is plugged in, macOS and the wheel's own firmware run a power-on
+    // initialization, and opening/calibrating it mid-initialization can leave the
+    // wheel in a state other apps (e.g. CrossOver) then fail to detect. Let that
+    // finish first. Removals/reconnects (we already hold a wheel) are handled
+    // promptly. Tune kHotplugConnectGrace if a wheel needs more or less time.
+    bool connecting = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        connecting = wheels_.empty();
+    }
+    if (connecting &&
+        (std::chrono::steady_clock::now() - device_change_observed_at_) < kHotplugConnectGrace) {
+        return;  // defer; re-checked on the next loop iteration
+    }
+
+    handled_change_seq_ = change_seq;
+    handle_device_change();
+}
+
+BridgeServer::Status BridgeServer::status() const {
+    // Don't block the caller (the UI status poll) if the worker thread is mid
+    // wheel update holding mutex_ across HID I/O. Refresh the cache when we can
+    // take the lock; otherwise return the last snapshot.
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (lock.owns_lock()) {
+        cached_status_ = status_;
+        return status_;
+    }
+    return cached_status_;
 }
 
 BridgeServer::WheelConnectResult BridgeServer::ensure_wheel_connected() {
@@ -192,14 +373,14 @@ BridgeServer::WheelConnectResult BridgeServer::ensure_wheel_connected() {
 }
 
 bool BridgeServer::complete_wheel_connect_cycle(bool force_reconnect) {
-    std::vector<std::unique_ptr<WheelController>> previous_wheels;
+    std::vector<std::unique_ptr<WheelDriver>> previous_wheels;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!force_reconnect && !wheels_.empty()) {
             status_.wheel_connected = true;
             if (status_.wheel_name.empty()) {
-                status_.wheel_name = "Logitech G923";
+                status_.wheel_name = "Supported wheel connected";
             }
             return true;
         }
@@ -208,7 +389,7 @@ bool BridgeServer::complete_wheel_connect_cycle(bool force_reconnect) {
             return false;
         }
 
-        begin_wheel_operation_locked(force_reconnect ? "Reconnecting G923..." : "Connecting to G923...");
+        begin_wheel_operation_locked(force_reconnect ? "Reconnecting wheel..." : "Connecting to wheel...");
         if (force_reconnect) {
             previous_wheels = std::move(wheels_);
         }
@@ -219,39 +400,75 @@ bool BridgeServer::complete_wheel_connect_cycle(bool force_reconnect) {
     auto wheels = device_manager_.find_known_wheels();
     if (wheels.empty()) {
         std::lock_guard<std::mutex> lock(mutex_);
-        finish_wheel_operation_locked({}, "No G923 detected");
+        finish_wheel_operation_locked({}, "No supported wheel detected");
         return false;
     }
 
-    std::vector<std::unique_ptr<WheelController>> initialized_wheels;
-
+    // Open only interfaces that can receive our FFB output reports, so the
+    // wheel's input-only interface is left free for the game (CrossOver) to
+    // claim. Fall back to every interface if none advertise output, so FFB is
+    // never lost to an overly-strict filter.
+    std::vector<HidDevice> ffb_interfaces;
     for (const auto& device : wheels) {
-        auto controller = std::make_unique<WheelController>(device);
-        if (!controller->initialize()) {
+        if (device.max_output_report_size() > 0) {
+            ffb_interfaces.push_back(device);
+        }
+    }
+    const std::vector<HidDevice>& candidates = ffb_interfaces.empty() ? wheels : ffb_interfaces;
+
+    std::vector<std::unique_ptr<WheelDriver>> initialized_wheels;
+    std::vector<std::string> initialized_names;
+    std::vector<std::string> unsupported_names;
+    bool saw_supported_profile = false;
+
+    for (const auto& device : candidates) {
+        const WheelProfile* profile = device.profile();
+        if (!profile) {
+            continue;
+        }
+
+        if (!profile->force_feedback_supported) {
+            unsupported_names.emplace_back(profile->name);
+            continue;
+        }
+
+        saw_supported_profile = true;
+        auto controller = wheel_registry::create_driver(device);
+        if (!controller || !controller->initialize()) {
             continue;
         }
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            status_.wheel_name = "Calibrating G923...";
+            status_.wheel_name = "Calibrating " + std::string(profile->name) + "...";
         }
 
-        if (!controller->calibrate()) {
+        if (device.uses_startup_calibration() && !controller->calibrate()) {
             continue;
         }
+        initialized_names.emplace_back(profile->name);
         initialized_wheels.push_back(std::move(controller));
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_wheels.empty()) {
+        const std::string base_name = initialized_names.empty() ? "Supported wheel" : initialized_names.front();
         const std::string wheel_name = initialized_wheels.size() > 1
-                                           ? "Logitech G923 (" + std::to_string(initialized_wheels.size()) + " interfaces)"
-                                           : "Logitech G923";
+                                           ? base_name + " (" + std::to_string(initialized_wheels.size()) + " interfaces)"
+                                           : base_name;
         finish_wheel_operation_locked(std::move(initialized_wheels), wheel_name);
         return true;
     }
 
-    finish_wheel_operation_locked({}, "Failed to calibrate G923");
+    if (!saw_supported_profile && !unsupported_names.empty()) {
+        const std::string wheel_name = unsupported_names.size() == 1
+                                           ? unsupported_names.front() + " detected (unsupported)"
+                                           : "Unsupported wheels detected";
+        finish_wheel_operation_locked({}, wheel_name);
+        return false;
+    }
+
+    finish_wheel_operation_locked({}, "Failed to calibrate supported wheel");
     return false;
 }
 
@@ -261,82 +478,50 @@ void BridgeServer::begin_wheel_operation_locked(const std::string& status_text) 
     status_.wheel_name = status_text;
 }
 
-void BridgeServer::finish_wheel_operation_locked(std::vector<std::unique_ptr<WheelController>> wheels,
+void BridgeServer::finish_wheel_operation_locked(std::vector<std::unique_ptr<WheelDriver>> wheels,
                                                  const std::string& status_text) {
     wheels_ = std::move(wheels);
     wheel_operation_in_progress_ = false;
     status_.wheel_connected = !wheels_.empty();
     status_.wheel_name = status_text;
-    have_last_wheel_state_ = false;
-    last_wheel_state_ = g923bridge::WheelStatePayload{};
-    last_constant_force_active_ = false;
-    have_last_constant_level_ = false;
-    last_constant_level_ = 0;
+    // A freshly opened wheel holds no forces; the game's last state goes back on.
+    desired_.redeliver();
 }
 
 void BridgeServer::disconnect_wheel_locked() {
     wheels_.clear();
     wheel_operation_in_progress_ = false;
     status_.wheel_connected = false;
-    last_constant_force_active_ = false;
-    have_last_constant_level_ = false;
-    last_constant_level_ = 0;
-    have_last_wheel_state_ = false;
-    last_wheel_state_ = g923bridge::WheelStatePayload{};
     if (status_.wheel_name.empty()) {
         status_.wheel_name = "Disconnected";
     }
 }
 
 void BridgeServer::stop_wheel_forces_locked() {
-    if (wheels_.empty()) {
-        return;
-    }
-
+    // Each driver's stop_forces() performs the full release and resets its own
+    // change-tracking, so the next game packet re-applies cleanly.
     for (auto& wheel : wheels_) {
-        if (!wheel || !wheel->is_initialized()) {
-            continue;
+        if (wheel && wheel->is_initialized()) {
+            wheel->stop_forces();
         }
-        wheel->stop_forces();
-        wheel->disable_autocenter();
-        wheel->set_custom_spring(0, 0, 0, 0, 0, 0, 0);
-        wheel->set_damper(0, 0, 0, 0);
     }
-    last_constant_force_active_ = false;
-    have_last_constant_level_ = false;
-    last_constant_level_ = 0;
-    have_last_wheel_state_ = false;
-    last_wheel_state_ = g923bridge::WheelStatePayload{};
 }
 
 void BridgeServer::server_loop() {
-    listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) {
-        return;
-    }
+    // This thread receives FFB updates and writes them to the wheel, so give it
+    // the highest QoS for prompt scheduling (low force-feedback latency).
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 
-    int yes = 1;
-    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(port_);
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
-        listen(listen_fd_, 1) != 0) {
-        close_if_open(listen_fd_);
-        return;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        status_.listening = true;
-    }
-
+    // listen_fd_ was created in start() before this thread was spawned, and is
+    // closed by stop() after this thread joins, so it is valid for the whole
+    // loop and this thread never needs to mutate it.
     complete_wheel_connect_cycle(false);
 
     while (!stop_requested_.load()) {
+        // Debounced hotplug reconciliation also runs inside run_client_session,
+        // so wheel attach/removal is handled even while a game keeps a socket open.
+        process_pending_device_change();
+
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(listen_fd_, &read_fds);
@@ -364,11 +549,8 @@ void BridgeServer::server_loop() {
             break;
         }
 
-        timeval client_timeout{};
-        client_timeout.tv_sec = 1;
-        client_timeout.tv_usec = 0;
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &client_timeout, sizeof(client_timeout));
-        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &client_timeout, sizeof(client_timeout));
+        configure_client_socket(client_fd);
+        os_log(bridge_log(), "game connected");
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -380,115 +562,163 @@ void BridgeServer::server_loop() {
         close_if_open(client_fd);
 
         std::lock_guard<std::mutex> lock(mutex_);
+        log_ffb_summary_locked(true);
+        os_log(bridge_log(), "game disconnected; forces stopped");
+        desired_.clear();
+        apply_failing_ = false;
         status_.client_connected = false;
         status_.client_name.clear();
         stop_wheel_forces_locked();
     }
 
-    close_if_open(listen_fd_);
+    // listen_fd_ is closed by stop() after this thread joins.
 }
 
 void BridgeServer::run_client_session(int client_fd) {
     while (!stop_requested_.load()) {
-        g923bridge::MessageHeader header{};
-        if (!recv_exact(client_fd, &header, sizeof(header))) {
+        process_pending_device_change();
+
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(client_fd, &read_fds);
+
+        timeval timeout{};
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 250000;
+
+        const int ready = select(client_fd + 1, &read_fds, nullptr, nullptr, &timeout);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (ready == 0) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            deliver_desired_state_locked();
+            log_ffb_summary_locked(false);
+            continue;
+        }
+
+        wheelio_bridge::MessageHeader header{};
+        if (!recv_exact(client_fd, &header, sizeof(header), stop_requested_)) {
+            os_log(bridge_log(), "connection closed by the game (errno %d)", errno);
             break;
         }
 
-        if (header.magic != g923bridge::kProtocolMagic ||
-            header.version != g923bridge::kProtocolVersion) {
+        if (header.magic != wheelio_bridge::kProtocolMagic ||
+            header.version != wheelio_bridge::kProtocolVersion) {
+            os_log_error(bridge_log(), "protocol mismatch: magic=0x%08x version=%u, expected 0x%08x version %u; "
+                         "the game's dinput8.dll is from another Wheelio version",
+                         static_cast<unsigned>(header.magic), static_cast<unsigned>(header.version),
+                         static_cast<unsigned>(wheelio_bridge::kProtocolMagic),
+                         static_cast<unsigned>(wheelio_bridge::kProtocolVersion));
+            break;
+        }
+
+        if (header.payload_size > wheelio_bridge::kMaxPayloadSize) {
+            os_log_error(bridge_log(), "oversized message type=%u size=%u", static_cast<unsigned>(header.type),
+                         static_cast<unsigned>(header.payload_size));
             break;
         }
 
         if (!handle_message(client_fd, header)) {
+            os_log_error(bridge_log(), "closing the connection after message type=%u failed",
+                         static_cast<unsigned>(header.type));
             break;
         }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        deliver_desired_state_locked();
+        log_ffb_summary_locked(false);
     }
 }
 
-bool BridgeServer::handle_message(int client_fd, const g923bridge::MessageHeader& header) {
-    switch (static_cast<g923bridge::MessageType>(header.type)) {
-        case g923bridge::MessageType::hello: {
-            if (header.payload_size != sizeof(g923bridge::HelloPayload)) {
+bool BridgeServer::handle_message(int client_fd, const wheelio_bridge::MessageHeader& header) {
+    switch (static_cast<wheelio_bridge::MessageType>(header.type)) {
+        case wheelio_bridge::MessageType::hello: {
+            if (header.payload_size != sizeof(wheelio_bridge::HelloPayload)) {
                 return false;
             }
 
-            g923bridge::HelloPayload payload{};
-            if (!recv_exact(client_fd, &payload, sizeof(payload))) {
+            wheelio_bridge::HelloPayload payload{};
+            if (!recv_exact(client_fd, &payload, sizeof(payload), stop_requested_)) {
                 return false;
             }
 
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 status_.client_name = payload.client_name;
+                char name[sizeof(payload.client_name) + 1] = {};
+                std::memcpy(name, payload.client_name, sizeof(payload.client_name));
+                os_log(bridge_log(), "hello from %{public}s pid=%u; wheel_connected=%d wheel=%{public}s", name,
+                       static_cast<unsigned>(payload.process_id), status_.wheel_connected ? 1 : 0,
+                       status_.wheel_name.c_str());
             }
 
             return send_hello_ack(client_fd);
         }
 
-        case g923bridge::MessageType::apply_wheel_state: {
-            if (header.payload_size != sizeof(g923bridge::WheelStatePayload)) {
+        case wheelio_bridge::MessageType::apply_wheel_state: {
+            if (header.payload_size != sizeof(wheelio_bridge::WheelStatePayload)) {
                 return false;
             }
 
-            g923bridge::WheelStatePayload payload{};
-            if (!recv_exact(client_fd, &payload, sizeof(payload))) {
+            wheelio_bridge::WheelStatePayload payload{};
+            if (!recv_exact(client_fd, &payload, sizeof(payload), stop_requested_)) {
                 return false;
             }
 
             const auto connect_result = ensure_wheel_connected();
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++ffb_counters_.received;
+            ffb_counters_.last = payload;
+            desired_.set(payload);
+            // The game stays connected whatever happens to the wheel; the
+            // state is applied once a wheel can take it.
             if (connect_result == WheelConnectResult::unavailable) {
-                return false;
-            }
-            if (connect_result == WheelConnectResult::busy) {
+                if (!apply_failing_) {
+                    os_log_error(bridge_log(), "force update with no wheel available (%{public}s); "
+                                 "applying it when a wheel connects", status_.wheel_name.c_str());
+                    apply_failing_ = true;
+                }
                 return true;
             }
-
-            std::lock_guard<std::mutex> lock(mutex_);
-            return apply_wheel_state_locked(payload);
+            if (connect_result == WheelConnectResult::busy) {
+                ++ffb_counters_.skipped_busy;
+                return true;
+            }
+            deliver_desired_state_locked();
+            return true;
         }
 
-        case g923bridge::MessageType::stop_all: {
-            if (header.payload_size != 0) {
-                std::array<std::uint8_t, 256> discard{};
-                std::size_t remaining = header.payload_size;
-                while (remaining > 0) {
-                    const std::size_t chunk = std::min(remaining, discard.size());
-                    if (!recv_exact(client_fd, discard.data(), chunk)) {
-                        return false;
-                    }
-                    remaining -= chunk;
-                }
+        case wheelio_bridge::MessageType::stop_all: {
+            if (header.payload_size != 0 && !discard_exact(client_fd, header.payload_size, stop_requested_)) {
+                return false;
             }
 
             std::lock_guard<std::mutex> lock(mutex_);
+            desired_.clear();
             stop_wheel_forces_locked();
+            ++ffb_counters_.stops;
             ++status_.packets_received;
             return true;
         }
 
-        case g923bridge::MessageType::ping: {
-            if (header.payload_size > 0) {
-                std::array<std::uint8_t, 256> discard{};
-                std::size_t remaining = header.payload_size;
-                while (remaining > 0) {
-                    const std::size_t chunk = std::min(remaining, discard.size());
-                    if (!recv_exact(client_fd, discard.data(), chunk)) {
-                        return false;
-                    }
-                    remaining -= chunk;
-                }
+        case wheelio_bridge::MessageType::ping: {
+            if (header.payload_size > 0 && !discard_exact(client_fd, header.payload_size, stop_requested_)) {
+                return false;
             }
             return true;
         }
 
-        case g923bridge::MessageType::set_led_pattern: {
-            if (header.payload_size != sizeof(g923bridge::LedPatternPayload)) {
+        case wheelio_bridge::MessageType::set_led_pattern: {
+            if (header.payload_size != sizeof(wheelio_bridge::LedPatternPayload)) {
                 return false;
             }
 
-            g923bridge::LedPatternPayload payload{};
-            if (!recv_exact(client_fd, &payload, sizeof(payload))) {
+            wheelio_bridge::LedPatternPayload payload{};
+            if (!recv_exact(client_fd, &payload, sizeof(payload), stop_requested_)) {
                 return false;
             }
 
@@ -510,7 +740,7 @@ bool BridgeServer::handle_message(int client_fd, const g923bridge::MessageHeader
 }
 
 bool BridgeServer::send_hello_ack(int client_fd) {
-    g923bridge::HelloAckPayload payload{};
+    wheelio_bridge::HelloAckPayload payload{};
     payload.accepted = 1;
 
     {
@@ -520,17 +750,19 @@ bool BridgeServer::send_hello_ack(int client_fd) {
         std::strncpy(payload.wheel_name, status_.wheel_name.c_str(), sizeof(payload.wheel_name) - 1);
     }
 
-    g923bridge::MessageHeader header{};
-    header.type = static_cast<std::uint16_t>(g923bridge::MessageType::hello_ack);
+    wheelio_bridge::MessageHeader header{};
+    header.type = static_cast<std::uint16_t>(wheelio_bridge::MessageType::hello_ack);
     header.payload_size = sizeof(payload);
 
-    return send_exact(client_fd, &header, sizeof(header)) &&
-            send_exact(client_fd, &payload, sizeof(payload));
+    return send_exact(client_fd, &header, sizeof(header), stop_requested_) &&
+            send_exact(client_fd, &payload, sizeof(payload), stop_requested_);
 }
 
-bool BridgeServer::apply_wheel_state_locked(const g923bridge::WheelStatePayload& payload) {
+bool BridgeServer::apply_wheel_state_locked(const wheelio_bridge::WheelStatePayload& payload) {
     if (wheel_operation_in_progress_) {
-        return true;
+        // Calibrating or reconnecting: not applied, so it stays pending.
+        ++ffb_counters_.skipped_busy;
+        return false;
     }
 
     if (wheels_.empty()) {
@@ -538,138 +770,71 @@ bool BridgeServer::apply_wheel_state_locked(const g923bridge::WheelStatePayload&
         return false;
     }
 
-    const bool has_any_effect =
-        payload.autocenter_enabled || payload.custom_spring_enabled ||
-        payload.damper_enabled || payload.constant_force_enabled;
-    int desired_constant_level = 0;
-    if (payload.constant_force_enabled) {
-        desired_constant_level = map_constant_magnitude_to_level(payload.constant_force_magnitude);
-        desired_constant_level = apply_constant_slew_limiter(
-            desired_constant_level, have_last_constant_level_, last_constant_level_);
-    }
-    const bool constant_active = desired_constant_level != 0;
-    const bool constant_level_changed = constant_active
-        ? (!have_last_constant_level_ || desired_constant_level != last_constant_level_)
-        : last_constant_force_active_;
-
-    if (!has_any_effect) {
-        stop_wheel_forces_locked();
-        have_last_wheel_state_ = true;
-        last_wheel_state_ = payload;
-        ++status_.packets_received;
-        return true;
-    }
-
-    if (have_last_wheel_state_ &&
-        std::memcmp(&payload, &last_wheel_state_, sizeof(payload)) == 0 &&
-        !constant_level_changed) {
-        ++status_.packets_received;
-        return true;
-    }
-
-    const bool spring_changed =
-        !have_last_wheel_state_ ||
-        payload.custom_spring_enabled != last_wheel_state_.custom_spring_enabled ||
-        payload.spring_deadband_left != last_wheel_state_.spring_deadband_left ||
-        payload.spring_deadband_right != last_wheel_state_.spring_deadband_right ||
-        payload.spring_k1 != last_wheel_state_.spring_k1 ||
-        payload.spring_k2 != last_wheel_state_.spring_k2 ||
-        payload.spring_sat1 != last_wheel_state_.spring_sat1 ||
-        payload.spring_sat2 != last_wheel_state_.spring_sat2 ||
-        payload.spring_clip != last_wheel_state_.spring_clip;
-    const bool damper_changed =
-        !have_last_wheel_state_ ||
-        payload.damper_enabled != last_wheel_state_.damper_enabled ||
-        payload.damper_force_positive != last_wheel_state_.damper_force_positive ||
-        payload.damper_force_negative != last_wheel_state_.damper_force_negative ||
-        payload.damper_saturation_positive != last_wheel_state_.damper_saturation_positive ||
-        payload.damper_saturation_negative != last_wheel_state_.damper_saturation_negative;
-    const bool autocenter_changed =
-        !have_last_wheel_state_ ||
-        payload.autocenter_enabled != last_wheel_state_.autocenter_enabled ||
-        payload.autocenter_force != last_wheel_state_.autocenter_force ||
-        payload.autocenter_slope != last_wheel_state_.autocenter_slope;
-    const bool constant_command_changed = constant_level_changed;
-    const bool led_changed =
-        !have_last_wheel_state_ ||
-        payload.led_pattern_enabled != last_wheel_state_.led_pattern_enabled ||
-        payload.led_pattern != last_wheel_state_.led_pattern;
-
+    // Hand the generic state + user tuning to each driver; the driver owns all
+    // manufacturer-specific mapping, change-detection and report encoding.
+    const FfbTuning tuning{force_gain_, spring_gain_, damper_gain_, smoothing_, min_force_};
     bool applied_to_any_wheel = false;
-
     for (auto& wheel : wheels_) {
-        if (!wheel || !wheel->is_initialized()) {
-            continue;
-        }
-
-        bool wheel_ok = true;
-
-        if (wheel_ok && spring_changed) {
-            wheel_ok = wheel->set_custom_spring(
-                payload.spring_deadband_left,
-                payload.spring_deadband_right,
-                payload.custom_spring_enabled ? payload.spring_k1 : 0,
-                payload.custom_spring_enabled ? payload.spring_k2 : 0,
-                payload.custom_spring_enabled ? payload.spring_sat1 : 0,
-                payload.custom_spring_enabled ? payload.spring_sat2 : 0,
-                payload.custom_spring_enabled ? payload.spring_clip : 0);
-        }
-
-        if (wheel_ok && damper_changed) {
-            wheel_ok = wheel->set_damper(
-                payload.damper_enabled ? payload.damper_force_positive : 0,
-                payload.damper_enabled ? payload.damper_force_negative : 0,
-                payload.damper_enabled ? payload.damper_saturation_positive : 0,
-                payload.damper_enabled ? payload.damper_saturation_negative : 0);
-        }
-
-        if (wheel_ok && autocenter_changed) {
-            if (payload.autocenter_enabled) {
-                wheel_ok = wheel->enable_autocenter() &&
-                          wheel->set_autocenter_spring(
-                              payload.autocenter_slope, payload.autocenter_slope, payload.autocenter_force);
-            } else {
-                wheel_ok = wheel->disable_autocenter();
-            }
-        }
-
-        if (wheel_ok && constant_command_changed) {
-            if (constant_active) {
-                const auto raw_level = static_cast<std::uint8_t>(
-                    std::max(0, std::min(255, 128 + desired_constant_level)));
-                wheel_ok = wheel->set_constant_force(raw_level);
-            } else if (last_constant_force_active_) {
-                wheel_ok = wheel->set_constant_force(128);
-            }
-        }
-
-        if (wheel_ok && led_changed) {
-            wheel->set_led_pattern(payload.led_pattern_enabled ? payload.led_pattern : 0);
-        }
-
-        if (wheel_ok) {
+        if (wheel && wheel->is_initialized() && wheel->apply_state(payload, tuning)) {
             applied_to_any_wheel = true;
         }
     }
 
     if (!applied_to_any_wheel) {
+        ++ffb_counters_.failed;
+        if (!apply_failing_) {
+            os_log_error(bridge_log(), "no wheel accepted the force update (%zu open, initialised=%d); "
+                         "retrying", wheels_.size(),
+                         wheels_.front() && wheels_.front()->is_initialized() ? 1 : 0);
+            apply_failing_ = true;
+        }
         status_.wheel_connected = false;
         return false;
     }
 
-    last_constant_force_active_ = constant_active;
-    if (constant_active) {
-        have_last_constant_level_ = true;
-        last_constant_level_ = desired_constant_level;
-    } else {
-        have_last_constant_level_ = false;
-        last_constant_level_ = 0;
+    if (apply_failing_) {
+        os_log(bridge_log(), "force updates reach the wheel again");
+        apply_failing_ = false;
     }
-
-    have_last_wheel_state_ = true;
-    last_wheel_state_ = payload;
+    ++ffb_counters_.applied;
     ++status_.packets_received;
     return true;
+}
+
+// Applies the game's last state if it hasn't reached the wheel yet and a wheel
+// can take it; called on each new state and on the session's idle ticks.
+void BridgeServer::deliver_desired_state_locked() {
+    if (!desired_.needs_delivery() || wheels_.empty() || wheel_operation_in_progress_) {
+        return;
+    }
+    if (apply_wheel_state_locked(desired_.state())) {
+        desired_.delivered();
+    }
+}
+
+// Once a second while force updates arrive (or when forced at disconnect):
+// what came in, what reached the wheel and the last state, with the tuning
+// that maps it, so the game's force range can be read off a session.
+void BridgeServer::log_ffb_summary_locked(bool force) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto& c = ffb_counters_;
+    if (c.received == 0 && c.stops == 0) {
+        return;
+    }
+    if (!force && now - last_ffb_summary_ < std::chrono::seconds(1)) {
+        return;
+    }
+    os_log(bridge_log(),
+           "ffb: received=%u applied=%u skipped_busy=%u failed=%u stops=%u | last constant=%d mag=%d "
+           "spring=%d k=%u/%u clip=%u damper=%d autocenter=%d | gain=%.2f spring_gain=%.2f "
+           "damper_gain=%.2f min_force=%.2f smoothing=%.2f",
+           c.received, c.applied, c.skipped_busy, c.failed, c.stops, c.last.constant_force_enabled,
+           static_cast<int>(c.last.constant_force_magnitude), c.last.custom_spring_enabled,
+           static_cast<unsigned>(c.last.spring_k1), static_cast<unsigned>(c.last.spring_k2),
+           static_cast<unsigned>(c.last.spring_clip), c.last.damper_enabled, c.last.autocenter_enabled,
+           force_gain_, spring_gain_, damper_gain_, min_force_, smoothing_);
+    ffb_counters_ = FfbCounters{};
+    last_ffb_summary_ = now;
 }
 
 bool BridgeServer::apply_led_pattern_locked(std::uint8_t pattern) {
@@ -685,17 +850,8 @@ bool BridgeServer::apply_led_pattern_locked(std::uint8_t pattern) {
     bool applied = false;
     for (auto& wheel : wheels_) {
         if (wheel && wheel->is_initialized()) {
-            applied = wheel->set_led_pattern(pattern) || applied;
+            applied = wheel->apply_led_pattern(pattern) || applied;
         }
-    }
-
-    if (applied) {
-        if (!have_last_wheel_state_) {
-            last_wheel_state_ = g923bridge::WheelStatePayload{};
-        }
-        last_wheel_state_.led_pattern_enabled = 1;
-        last_wheel_state_.led_pattern = pattern;
-        have_last_wheel_state_ = true;
     }
 
     ++status_.packets_received;
