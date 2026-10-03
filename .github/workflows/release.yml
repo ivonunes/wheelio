@@ -212,7 +212,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "v${VERSION}" "dist/wheelio-${VERSION}.zip" \
+          # The checksums file is what the Homebrew tap reads to update its cask.
+          (cd dist && shasum -a 256 "wheelio-${VERSION}.zip" > "wheelio-v${VERSION}-SHA256SUMS")
+          gh release create "v${VERSION}" "dist/wheelio-${VERSION}.zip" "dist/wheelio-v${VERSION}-SHA256SUMS" \
             --verify-tag \
             --title "Wheelio ${VERSION}" \
             --generate-notes
