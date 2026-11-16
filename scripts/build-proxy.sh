@@ -20,12 +20,12 @@ cmake -S "${repo_root}" -B "${build_dir}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_WINDOWS_PROXY=ON \
     -DCMAKE_TOOLCHAIN_FILE="${toolchain}"
-cmake --build "${build_dir}" --target wheelio_dinput8 wheelio_openxr_runtime wheelio_xr_smoke
+cmake --build "${build_dir}" -j "$(sysctl -n hw.ncpu)" --target wheelio_dinput8 wheelio_openxr_runtime wheelio_xr_smoke
 
 cmake -S "${repo_root}" -B "${build_dir_x86}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_WINDOWS_PROXY=ON \
     -DCMAKE_TOOLCHAIN_FILE="${toolchain_x86}"
-cmake --build "${build_dir_x86}" --target wheelio_dinput8
+cmake --build "${build_dir_x86}" -j "$(sysctl -n hw.ncpu)" --target wheelio_dinput8
 
 echo "Built ${build_dir}/dinput8.dll, ${build_dir_x86}/dinput8.dll (32-bit) and ${build_dir}/wheelio_openxr.dll"

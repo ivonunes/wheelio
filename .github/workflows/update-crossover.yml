@@ -1,0 +1,68 @@
+name: Update CrossOver
+
+# Weekly check for a newer CrossOver source release. engine/update-crossover.sh
+# rebases engine/patches onto it with git's three-way merge, and the result
+# goes to a pull request on the fixed `crossover-update` branch, where the
+# normal Engine check builds it. When a patch no longer applies, the PR is a
+# draft that names the conflict. The PR is edited in place on later runs and
+# closed once main has the newest release. See scripts/open-update-pr.sh for
+# how the PR's checks are started.
+#
+# The branch is pushed with the deploy key in the `updates` environment, which
+# only main may use and which needs no approval.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-crossover
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Check CrossOver
+    runs-on: ubuntu-latest
+    environment: updates
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+          ssh-key: ${{ secrets.UPDATES_DEPLOY_KEY }}
+
+      - name: Look for a newer release and rebase the patches
+        id: update
+        run: |
+          set +e
+          engine/update-crossover.sh >"$RUNNER_TEMP/pr-body.md"
+          status=$?
+          set -e
+          case $status in
+            0) echo "result=updated" >>"$GITHUB_OUTPUT" ;;
+            2) echo "result=conflict" >>"$GITHUB_OUTPUT" ;;
+            3) echo "result=current" >>"$GITHUB_OUTPUT" ;;
+            *) exit "$status" ;;
+          esac
+
+      - name: Close a stale PR
+        if: steps.update.outputs.result == 'current'
+        run: |
+          pr="$(gh pr list --head crossover-update --state open --json number --jq '.[0].number' || true)"
+          if [ -n "$pr" ]; then
+            gh pr close "$pr" --comment "main already has CodeWeavers' newest CrossOver release." --delete-branch
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Open or update the PR
+        if: steps.update.outputs.result != 'current'
+        run: scripts/open-update-pr.sh crossover-update "Update CrossOver" "$RUNNER_TEMP/pr-body.md" ${DRAFT:+"$DRAFT"}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT: ${{ steps.update.outputs.result == 'conflict' && '--draft' || '' }}

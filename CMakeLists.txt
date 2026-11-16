@@ -33,19 +33,24 @@ target_compile_definitions(wheelio_compile_options INTERFACE
     $<$<CONFIG:MinSizeRel>:UTI_RELEASE>
 )
 
+set(PURR_FORCE_FEEDBACK "${CMAKE_CURRENT_SOURCE_DIR}/purr/modules/force_feedback")
+
 set(WHEELIO_BRIDGE_COMMON_SOURCES
-    bridge/common/ffb_mapping.cpp
     bridge/common/dinput_effects.cpp
 )
 
 if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
+    # The game's DirectInput effects summed into the bridge's state, and that
+    # state mapped to what Purr's wheel session plays.
     add_executable(wheelio_tests
-        tests/ffb_mapping_tests.cpp
+        tests/force_feedback_tests.cpp
+        bridge/macos/force_mapping.cpp
         ${WHEELIO_BRIDGE_COMMON_SOURCES}
     )
 
     target_include_directories(wheelio_tests PRIVATE
         bridge/include
+        ${PURR_FORCE_FEEDBACK}
     )
 
     target_link_libraries(wheelio_tests
@@ -68,41 +73,26 @@ if(BUILD_TESTING AND NOT CMAKE_CROSSCOMPILING)
     )
 
     add_test(NAME wheelio_protocol_tests COMMAND wheelio_protocol_tests)
+endif()
 
-    # Logitech command encoding + the pure FFB command planner (force mapping,
-    # gain/smoothing, redundant-write suppression) + the wheel registry. These
-    # link the macOS app's command/plan sources (no IOKit calls, header-only).
-    add_executable(wheelio_driver_tests
-        tests/driver_tests.cpp
-        src/command.cpp
-        src/types.cpp
-        src/ffb_command_plan.cpp
-        ${WHEELIO_BRIDGE_COMMON_SOURCES}
-    )
-
-    target_include_directories(wheelio_driver_tests PRIVATE
-        include
-        bridge/include
-    )
-
-    target_link_libraries(wheelio_driver_tests
-        wheelio_compile_options
-    )
-
-    add_test(NAME wheelio_driver_tests COMMAND wheelio_driver_tests)
+# The Steam Play patch (steam/, arm64 macOS) brings its own tests.
+if(APPLE AND NOT CMAKE_CROSSCOMPILING)
+    add_subdirectory(steam)
 endif()
 
 if(BUILD_WINDOWS_PROXY)
+    # Purr's wheel list (known_wheels.cpp) says which devices get force feedback.
     add_library(wheelio_dinput8 SHARED
         ${WHEELIO_BRIDGE_COMMON_SOURCES}
         bridge/windows/bridge_client.cpp
         bridge/windows/dinput8_proxy.cpp
+        ${PURR_FORCE_FEEDBACK}/known_wheels.cpp
     )
 
     target_include_directories(wheelio_dinput8 PRIVATE
-        include
         bridge/include
         bridge/windows/include
+        ${PURR_FORCE_FEEDBACK}
     )
 
     set_target_properties(wheelio_dinput8 PROPERTIES
@@ -125,23 +115,21 @@ if(BUILD_WINDOWS_PROXY)
         ws2_32
     )
 
-    # OpenXR runtime loaded by the game's OpenXR loader (registered via the
-    # runtime manifest bridge/windows/openxr/wheelio_openxr.json). 64-bit games
-    # only: no 32-bit game runs in VR.
+    # Purr's OpenXR runtime (purr/modules/vr_streamer/runtime), loaded by the
+    # game's OpenXR loader through the manifest bridge/windows/openxr/wheelio_openxr.json.
+    # It writes each frame to a file in the bottle's temp folder, where the app
+    # finds it and runs the streamer. 64-bit games only: no 32-bit game runs in VR.
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    add_library(wheelio_openxr_runtime SHARED
-        bridge/windows/openxr/frame_export.cpp
-        bridge/windows/openxr/openxr_runtime.cpp
-        bridge/windows/openxr/png_writer.cpp
-        bridge/windows/openxr/readback_d3d11.cpp
-        bridge/windows/openxr/readback_d3d12.cpp
-        bridge/windows/openxr/runtime_log.cpp
-    )
+    set(PURR_THIRDPARTY "${CMAKE_CURRENT_SOURCE_DIR}/purr/godot/thirdparty")
+    file(GLOB PURR_VR_RUNTIME_SOURCES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/purr/modules/vr_streamer/runtime/*.cpp")
+    add_library(wheelio_openxr_runtime SHARED ${PURR_VR_RUNTIME_SOURCES})
 
     target_include_directories(wheelio_openxr_runtime PRIVATE
-        bridge/include
-        bridge/windows/include
-        bridge/windows/openxr
+        ${PURR_THIRDPARTY}/openxr/include
+        ${PURR_THIRDPARTY}/vulkan/include
+        ${PURR_THIRDPARTY}/directx_headers/include/directx
+        ${PURR_THIRDPARTY}/directx_headers/include
     )
 
     set_target_properties(wheelio_openxr_runtime PROPERTIES
@@ -149,21 +137,27 @@ if(BUILD_WINDOWS_PROXY)
         OUTPUT_NAME wheelio_openxr
     )
 
+    # Purr's code builds to Purr's warnings, not Wheelio's -Werror. Everything
+    # is linked statically: the bottle has no mingw runtime DLLs.
+    target_compile_options(wheelio_openxr_runtime PRIVATE -O2)
     target_link_options(wheelio_openxr_runtime PRIVATE
+        -static
         -static-libgcc
         -static-libstdc++
     )
 
     target_link_libraries(wheelio_openxr_runtime
-        wheelio_compile_options
+        d3d11
+        d3d12
         dxgi
         dxguid
+        ole32
     )
 
     # Stand-in for a game: exercises the runtime on D3D11 and D3D12 inside a
     # bottle. A development tool, not shipped.
     add_executable(wheelio_xr_smoke bridge/windows/openxr/smoke/xr_smoke.cpp)
-    target_include_directories(wheelio_xr_smoke PRIVATE bridge/windows/include)
+    target_include_directories(wheelio_xr_smoke PRIVATE ${PURR_THIRDPARTY}/openxr/include)
     # OpenXR structs are initialised {XR_TYPE_...} with the rest zeroed.
     target_compile_options(wheelio_xr_smoke PRIVATE -Wno-missing-field-initializers)
     target_link_options(wheelio_xr_smoke PRIVATE -static-libgcc -static-libstdc++)

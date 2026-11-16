@@ -3,11 +3,12 @@
 // This is the entire boundary between the Swift UI and the C++ engine. It
 // exposes only POD types (no std::string / std::thread cross the line), so it
 // imports cleanly into Swift via the app's bridging header. The engine itself
-// (BridgeServer, DeviceManager, WheelController, the wire protocol shared with
-// the Windows dinput8.dll) stays in C++ and is unchanged.
+// (BridgeServer, Purr's WheelSession, the wire protocol shared with the
+// Windows dinput8.dll) stays in C++.
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -40,8 +41,8 @@ void wheelio_bridge_start(WheelioBridge *bridge);
 // Stop the server and release force feedback on the wheel. Idempotent.
 void wheelio_bridge_stop(WheelioBridge *bridge);
 
-// Force a wheel reconnect/recalibrate cycle. Blocks while it runs; call off the
-// main thread.
+// Let the wheel go and take it again. Blocks while it runs; call off the main
+// thread.
 void wheelio_bridge_reconnect_wheel(WheelioBridge *bridge);
 
 // App-side force-feedback trims (1.0 = unchanged, clamped to [0, 2]). Cheap;
@@ -57,8 +58,9 @@ void wheelio_bridge_set_smoothing(WheelioBridge *bridge, double amount);
 // starts from, lifting small forces over the wheel's dead zone. 0 = off.
 void wheelio_bridge_set_min_force(WheelioBridge *bridge, double fraction);
 
-// Briefly pulse force + LEDs on the connected wheel so the user can confirm it
-// works. Blocks (~0.7s); call off the main thread.
+// Briefly pulse the force each way and sweep the rev lights on the connected
+// wheel so the user can confirm it works. Blocks (~0.7s); call off the main
+// thread.
 void wheelio_bridge_self_test(WheelioBridge *bridge);
 
 // Copy the current status into `out`. Thread-safe (the engine guards it with a
@@ -70,14 +72,22 @@ void wheelio_bridge_destroy(WheelioBridge *bridge);
 
 // --- VR ------------------------------------------------------------------
 //
-// The OpenXR runtime running inside the CrossOver bottle keeps a shared buffer
-// while a game renders in VR. The app watches it to know when to run the
+// The OpenXR runtime running inside a game's Wine environment keeps a shared
+// buffer while the game renders in VR. The app watches it to know when to run the
 // streamer. Safe to poll; never triggers any work in the game.
 
 typedef struct {
     bool connected;     // a runtime buffer is mapped
     bool game_running;  // frames were submitted in the last few seconds
+    char frames_path[1024];  // the buffer's file, for the streamer; empty if none
+    uint32_t eye_width;      // each eye's size in it
+    uint32_t eye_height;
 } WheelioVRStatus;
+
+// The folders holding each game's Wine environment: every Steam library's
+// steamapps/compatdata, with a game's prefix in <folder>/<app id>/pfx. Cheap;
+// call whenever they may have changed.
+void wheelio_vr_set_search_folders(WheelioBridge *bridge, const char *const *folders, size_t count);
 
 // Look for a runtime buffer and refresh the connection. Cheap to poll.
 void wheelio_vr_poll(WheelioBridge *bridge);

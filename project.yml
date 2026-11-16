@@ -2,9 +2,11 @@
 #
 # Regenerate the .xcodeproj with:  xcodegen generate   (or scripts/gen-xcode.sh)
 #
-# This builds ONLY the macOS UI app. The C++ engine sources are compiled
-# directly into this target; the Windows dinput8.dll stays on CMake (it shares
-# bridge/common + bridge/include with this target via the same source files).
+# This builds ONLY the macOS UI app. The C++ engine sources, and Purr's wheel
+# drivers (purr/modules/force_feedback, all but its Godot wrappers), are
+# compiled directly into this target; the Windows dinput8.dll stays on CMake
+# (it shares bridge/common + bridge/include with this target via the same
+# source files).
 name: Wheelio
 
 options:
@@ -42,13 +44,33 @@ targets:
       # C shim (the UI <-> engine boundary)
       - path: bridge/macos/wheelio_bridge_c.h
       - path: bridge/macos/wheelio_bridge_c.cpp
-      # macOS engine glue (socket server + wheel logic; header is in bridge/include)
+      # macOS engine glue (socket server, and the game's forces mapped for the wheel)
       - path: bridge/macos/bridge_server.cpp
-      # VR frame preview: reads what the OpenXR runtime publishes from the bottle
+      - path: bridge/macos/force_mapping.cpp
+      # Watches for a game in VR: reads what the OpenXR runtime publishes in the bottle
       - path: bridge/macos/vr_frame_reader.cpp
-      # Wheel core (IOKit HID)
-      - path: src
-      - path: include
+      # The Steam patch's pre-check: whether the patch would apply to a Steam build
+      - path: steam/src
+        includes:
+          - "anchor_resolver.c"
+          - "macho_image.c"
+          - "reference_scanner.c"
+          - "steam_anchors.c"
+          - "steam_build_version.c"
+          - "steam_patch_plan.c"
+          - "steam_report.c"
+          - "wheelio_steam_check.c"
+      # Purr's wheel drivers, as its tests/run.sh builds them without Godot
+      - path: purr/modules/force_feedback
+        includes:
+          - "wheel_log.cpp"
+          - "vibration.cpp"
+          - "wheel_player.cpp"
+          - "wheel_session.cpp"
+          - "known_wheels.cpp"
+          - "drivers/*.cpp"
+          - "drivers/*/*.cpp"
+          - "macos/*.cpp"
       # Shared protocol + effect mapping (also compiled into the Windows DLL)
       - path: bridge/common
       - path: bridge/include
@@ -64,9 +86,12 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: app/Wheelio-Bridging-Header.h
         CODE_SIGN_ENTITLEMENTS: app/Wheelio.entitlements
         HEADER_SEARCH_PATHS:
-          - "$(SRCROOT)/include"
+          - "$(SRCROOT)/purr/modules/force_feedback"
           - "$(SRCROOT)/bridge/include"
+          - "$(SRCROOT)/steam/include"
           - "$(SRCROOT)/bridge/macos"
+          # vr_shared.hpp: the frames file's layout, from Purr's runtime
+          - "$(SRCROOT)/purr/modules/vr_streamer/runtime"
     info:
       path: bridge/macos/Wheelio-Info.plist
       properties:
@@ -79,6 +104,8 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         # The VR streamer taps system audio to send the game's sound to the headset.
         NSAudioCaptureUsageDescription: "Wheelio sends the game's sound to your VR headset."
+        # The VR streamer finds Steam Link headsets on the local network.
+        NSLocalNetworkUsageDescription: "Wheelio looks for VR headsets on your network."
         # macOS asks this for any audio input, including the system audio tap. Wheelio never records a microphone.
         NSMicrophoneUsageDescription: "Wheelio captures the game's sound for your VR headset. It does not record your microphone."
     dependencies:
@@ -86,11 +113,11 @@ targets:
       - sdk: CoreFoundation.framework
       - sdk: AppKit.framework
     postBuildScripts:
-      # Bundle the Windows proxy dinput8.dll into the app's Resources so the
-      # in-app "Set Up a Game" installer works in any build (Debug included),
-      # not just release.sh packaging. Best-effort: copies a prebuilt DLL if
-      # present, builds it once if mingw-w64 is available, and otherwise warns
-      # without failing the build.
+      # Bundle the Windows proxy dinput8.dll into the app's Resources, from
+      # where the engine's launcher gives it to each game, in any build (Debug
+      # included), not just release.sh packaging. Best-effort: copies a
+      # prebuilt DLL if present, builds it once if mingw-w64 is available, and
+      # otherwise warns without failing the build.
       - name: Bundle proxy DLL
         script: |
           "${SRCROOT}/scripts/bundle-proxy-dll.sh"
@@ -101,6 +128,14 @@ targets:
       - name: Bundle streamer
         script: |
           "${SRCROOT}/scripts/bundle-streamer.sh"
+      # And the Steam Play patch, which the app installs for Steam.
+      - name: Bundle Steam patch
+        script: |
+          "${SRCROOT}/scripts/bundle-steam-patch.sh"
+      # And the engine this build pins, once one has been published.
+      - name: Bundle engine pin
+        script: |
+          "${SRCROOT}/scripts/bundle-engine-pin.sh"
     scheme:
       testTargets:
         - WheelioTests
@@ -111,11 +146,35 @@ targets:
     type: bundle.unit-test
     platform: macOS
     sources:
-      - app/CrossOverSupport.swift
       - app/UpdateChecker.swift
+      - app/KeyValues.swift
+      - app/WheelioPaths.swift
+      - app/Steam.swift
+      - app/SteamCompatTool.swift
+      - app/SteamGames.swift
+      - app/Engine.swift
+      - app/SteamPatch.swift
+      - app/GamePortingToolkit.swift
+      - app/BinaryKeyValues.swift
+      - app/SteamShortcuts.swift
+      - app/WindowsShortcut.swift
+      - app/WinePrefix.swift
+      - path: steam/src
+        includes:
+          - "anchor_resolver.c"
+          - "macho_image.c"
+          - "reference_scanner.c"
+          - "steam_anchors.c"
+          - "steam_build_version.c"
+          - "steam_patch_plan.c"
+          - "steam_report.c"
+          - "wheelio_steam_check.c"
       - tests/swift
     settings:
       base:
         SWIFT_VERSION: "5.0"
         PRODUCT_BUNDLE_IDENTIFIER: uk.ivonunes.wheelio.tests
         GENERATE_INFOPLIST_FILE: YES
+        SWIFT_OBJC_BRIDGING_HEADER: tests/swift/WheelioTests-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/steam/include"

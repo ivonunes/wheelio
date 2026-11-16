@@ -19,29 +19,19 @@ std::uint32_t clamp_u32(std::uint32_t value, std::uint32_t minimum, std::uint32_
     return std::max(minimum, std::min(maximum, value));
 }
 
-std::uint32_t max_u32(std::uint32_t a, std::uint32_t b) {
-    return a > b ? a : b;
+// Of two coefficients, the one that asks more of the wheel.
+std::int16_t stronger(std::int32_t current, std::int32_t candidate) {
+    return static_cast<std::int16_t>(abs_i32(candidate) > abs_i32(current) ? candidate : current);
 }
 
-std::uint8_t max_u8(std::uint8_t a, std::uint8_t b) {
-    return a > b ? a : b;
+std::uint16_t larger(std::uint32_t current, std::uint32_t candidate) {
+    return static_cast<std::uint16_t>(std::min<std::uint32_t>(std::max(current, candidate), kDirectInputNominalMax));
 }
 
-std::uint8_t scale_byte(std::int32_t value, std::int32_t source_max = kDirectInputNominalMax) {
-    const std::int32_t clamped = clamp_i32(value, 0, source_max);
-    return static_cast<std::uint8_t>((clamped * 255) / source_max);
-}
-
-std::uint8_t scale_nibble(std::int32_t value, std::int32_t source_max = kDirectInputNominalMax) {
-    const std::int32_t clamped = clamp_i32(value, 0, source_max);
-    return static_cast<std::uint8_t>((clamped * 15) / source_max);
-}
-
-std::uint8_t scale_condition_deadband(std::int32_t deadband, std::int32_t offset, bool positive_side) {
-    const std::int32_t clamped_offset = clamp_i32(offset, -kDirectInputNominalMax, kDirectInputNominalMax);
-    const std::int32_t shifted = positive_side ? deadband + clamped_offset : deadband - clamped_offset;
-    return scale_nibble(shifted);
-}
+// DirectInput's autocentre, played while the game has no effect running: a
+// stiff spring held to about a third of the wheel's strength.
+constexpr std::int32_t kAutocentreCoefficient = kDirectInputNominalMax;
+constexpr std::uint32_t kAutocentreSaturation = 3200;
 
 std::uint32_t apply_unsigned_gain(std::uint32_t value, std::uint32_t gain) {
     const std::uint32_t clamped_gain = clamp_u32(gain, 0, kDirectInputNominalMax);
@@ -319,70 +309,50 @@ void directinput_apply_effect_to_payload(DirectInputEffectKind kind,
         return;
     }
 
-    if (kind == DirectInputEffectKind::spring) {
-        payload.custom_spring_enabled = 1;
-        const std::uint32_t positive_sat = apply_combined_gain_unsigned(
-            state.conditions[0].positive_saturation, state.effect_gain, device_gain);
-        const std::uint32_t negative_sat = apply_combined_gain_unsigned(
-            state.conditions[1].negative_saturation, state.effect_gain, device_gain);
-        const std::int32_t positive_coeff = apply_combined_gain(
-            abs_i32(state.conditions[0].positive_coefficient), state.effect_gain, device_gain);
-        const std::int32_t negative_coeff = apply_combined_gain(
-            abs_i32(state.conditions[1].negative_coefficient), state.effect_gain, device_gain);
+    // Conditions act on each axis separately; the first is the steering's (the
+    // proxy copies it to the second for a one-axis effect).
+    const DirectInputCondition& steering = state.conditions[0];
+    const auto coefficient = [&](std::int32_t value) {
+        return apply_combined_gain(clamp_i32(value, -kDirectInputNominalMax, kDirectInputNominalMax),
+                                   state.effect_gain, device_gain);
+    };
+    const auto saturation = [&](std::uint32_t value) {
+        return apply_combined_gain_unsigned(value, state.effect_gain, device_gain);
+    };
 
-        payload.spring_k1 = max_u8(payload.spring_k1, scale_nibble(positive_coeff));
-        payload.spring_k2 = max_u8(payload.spring_k2, scale_nibble(negative_coeff));
-        payload.spring_sat1 = max_u8(payload.spring_sat1, scale_nibble(static_cast<std::int32_t>(positive_sat)));
-        payload.spring_sat2 = max_u8(payload.spring_sat2, scale_nibble(static_cast<std::int32_t>(negative_sat)));
-        payload.spring_deadband_left =
-            max_u8(payload.spring_deadband_left,
-                   scale_condition_deadband(state.conditions[0].deadband,
-                                            state.conditions[0].offset,
-                                            false));
-        payload.spring_deadband_right =
-            max_u8(payload.spring_deadband_right,
-                   scale_condition_deadband(state.conditions[1].deadband,
-                                            state.conditions[1].offset,
-                                            true));
-        payload.spring_clip = max_u8(
-            payload.spring_clip,
-            scale_byte(static_cast<std::int32_t>(max_u32(positive_sat, negative_sat))));
+    if (kind == DirectInputEffectKind::spring) {
+        // Several springs share the first one's centre and take the stronger
+        // of each side.
+        if (!payload.spring_enabled) {
+            payload.spring_offset = static_cast<std::int16_t>(
+                clamp_i32(steering.offset, -kDirectInputNominalMax, kDirectInputNominalMax));
+            payload.spring_deadband = static_cast<std::uint16_t>(clamp_i32(steering.deadband, 0, kDirectInputNominalMax));
+        }
+        payload.spring_enabled = 1;
+        payload.spring_positive_coefficient =
+            stronger(payload.spring_positive_coefficient, coefficient(steering.positive_coefficient));
+        payload.spring_negative_coefficient =
+            stronger(payload.spring_negative_coefficient, coefficient(steering.negative_coefficient));
+        payload.spring_positive_saturation =
+            larger(payload.spring_positive_saturation, saturation(steering.positive_saturation));
+        payload.spring_negative_saturation =
+            larger(payload.spring_negative_saturation, saturation(steering.negative_saturation));
         return;
     }
 
-    if (kind == DirectInputEffectKind::damper ||
-        kind == DirectInputEffectKind::friction ||
-        kind == DirectInputEffectKind::inertia) {
-        payload.damper_enabled = 1;
-        payload.damper_force_positive = max_u8(
-            payload.damper_force_positive,
-            scale_byte(apply_combined_gain(abs_i32(state.conditions[0].positive_coefficient),
-                                           state.effect_gain,
-                                           device_gain)));
-        payload.damper_force_negative = max_u8(
-            payload.damper_force_negative,
-            scale_byte(apply_combined_gain(abs_i32(state.conditions[1].negative_coefficient),
-                                           state.effect_gain,
-                                           device_gain)));
-        payload.damper_saturation_positive = max_u8(
-            payload.damper_saturation_positive,
-            scale_byte(static_cast<std::int32_t>(apply_combined_gain_unsigned(
-                state.conditions[0].positive_saturation, state.effect_gain, device_gain))));
-        payload.damper_saturation_negative = max_u8(
-            payload.damper_saturation_negative,
-            scale_byte(static_cast<std::int32_t>(apply_combined_gain_unsigned(
-                state.conditions[1].negative_saturation, state.effect_gain, device_gain))));
+    if (kind == DirectInputEffectKind::damper || kind == DirectInputEffectKind::inertia ||
+        kind == DirectInputEffectKind::friction) {
+        const std::uint32_t strength = static_cast<std::uint32_t>(std::max(
+            abs_i32(coefficient(steering.positive_coefficient)), abs_i32(coefficient(steering.negative_coefficient))));
+        std::uint16_t& field = kind == DirectInputEffectKind::friction ? payload.friction : payload.damper;
+        field = larger(field, strength);
         return;
     }
 
     const std::int32_t force = directinput_compute_force(kind, state, device_gain, now_us);
-    if (force != 0) {
-        payload.constant_force_enabled = 1;
-        payload.constant_force_magnitude = static_cast<std::int16_t>(
-            clamp_i32(static_cast<std::int32_t>(payload.constant_force_magnitude) + force,
-                      -kDirectInputNominalMax,
-                      kDirectInputNominalMax));
-    }
+    payload.constant_force = static_cast<std::int16_t>(
+        clamp_i32(static_cast<std::int32_t>(payload.constant_force) + force, -kDirectInputNominalMax,
+                  kDirectInputNominalMax));
 }
 
 WheelStatePayload build_directinput_payload(DirectInputEffectView* effects,
@@ -392,6 +362,9 @@ WheelStatePayload build_directinput_payload(DirectInputEffectView* effects,
                                             bool output_disabled,
                                             std::uint64_t now_us) {
     WheelStatePayload payload{};
+    if (output_disabled) {
+        return payload;
+    }
 
     for (std::size_t i = 0; effects && i < effect_count; ++i) {
         if (!effects[i].state) {
@@ -401,20 +374,16 @@ WheelStatePayload build_directinput_payload(DirectInputEffectView* effects,
         directinput_apply_effect_to_payload(effects[i].kind, *effects[i].state, device_gain, payload, now_us);
     }
 
-    // DirectInput's autocenter applies while no effect is playing. Stacking it
+    // DirectInput's autocentre applies while no effect is playing. Stacking it
     // under the game's own road forces would fight them.
-    if (autocenter_enabled && !payload.custom_spring_enabled && !payload.damper_enabled &&
-        !payload.constant_force_enabled) {
-        constexpr std::uint32_t kAutocenterFallbackNominal = 3200;
-        payload.autocenter_enabled = 1;
-        payload.autocenter_force = max_u8(
-            payload.autocenter_force,
-            scale_byte(static_cast<std::int32_t>(apply_unsigned_gain(kAutocenterFallbackNominal, device_gain))));
-        payload.autocenter_slope = max_u8(payload.autocenter_slope, 4);
-    }
-
-    if (output_disabled) {
-        payload = WheelStatePayload{};
+    if (autocenter_enabled && !has_effects(payload)) {
+        const std::int32_t coefficient = apply_signed_gain(kAutocentreCoefficient, device_gain);
+        const std::uint32_t saturation = apply_unsigned_gain(kAutocentreSaturation, device_gain);
+        payload.spring_enabled = 1;
+        payload.spring_positive_coefficient = static_cast<std::int16_t>(coefficient);
+        payload.spring_negative_coefficient = static_cast<std::int16_t>(coefficient);
+        payload.spring_positive_saturation = static_cast<std::uint16_t>(saturation);
+        payload.spring_negative_saturation = static_cast<std::uint16_t>(saturation);
     }
 
     return payload;

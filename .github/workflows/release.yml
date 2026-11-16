@@ -70,6 +70,21 @@ jobs:
             exit 1
           fi
 
+      # The app pins one engine (app/engine-release.json, written by
+      # release-engine.yml). It must be the engine/ this release is built from.
+      - name: Check the engine is released
+        run: |
+          set -euo pipefail
+          if [[ ! -f app/engine-release.json ]]; then
+            echo "::error::No engine has been released yet. Run the Release engine workflow first." >&2
+            exit 1
+          fi
+          pinned="$(jq -r .source app/engine-release.json)"
+          if [[ "${pinned}" != "$(git rev-parse HEAD:engine)" ]]; then
+            echo "::error::engine/ has changed since engine $(jq -r .version app/engine-release.json) was released. Run the Release engine workflow first." >&2
+            exit 1
+          fi
+
   test:
     name: Test
     needs: check
@@ -86,6 +101,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+          submodules: true
 
       - name: Set the version
         run: ./scripts/set-version.sh "${VERSION}"
@@ -97,8 +113,7 @@ jobs:
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d  # stable
 
       - name: Build the VR streamer
-        working-directory: streamer
-        run: cargo build --release
+        run: scripts/streamer-cargo.sh build --release
 
       - name: Build and stage
         run: ./scripts/release.sh build

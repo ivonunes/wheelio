@@ -5,9 +5,6 @@ struct WheelioApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var bridge = BridgeController.shared
 
-    static let setupWindowID = "wheelio-setup"
-    static let settingsWindowID = "wheelio-settings"
-
     init() {
         // Before anything opens the wheel or the bridge port.
         SingleInstance.handOverIfAlreadyRunning()
@@ -23,24 +20,17 @@ struct WheelioApp: App {
                 ? "steeringwheel" : "exclamationmark.triangle.fill")
         }
 
-        Window("Set Up a Game", id: Self.setupWindowID) {
-            SetupView()
-        }
-        .windowResizability(.contentSize)
-
-        Window("Wheelio Settings", id: Self.settingsWindowID) {
+        Settings {
             SettingsView()
         }
-        .windowResizability(.contentSize)
-
     }
 }
 
-/// The menu-bar dropdown. Split out so it can use the openWindow environment.
+/// The menu-bar dropdown. Split out so it can use the openSettings environment.
 private struct MenuContent: View {
     @ObservedObject var bridge: BridgeController
     @ObservedObject private var updates = UpdateChecker.shared
-    @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         if case let .updateAvailable(version, _) = updates.state {
@@ -75,8 +65,7 @@ private struct MenuContent: View {
 
         Divider()
 
-        Button("Set Up a Game\u{2026}") { present(WheelioApp.setupWindowID) }
-        Button("Settings\u{2026}") { present(WheelioApp.settingsWindowID) }
+        Button("Settings\u{2026}") { presentSettings() }
             .keyboardShortcut(",")
 
         Button(bridge.isReconnecting ? "Reconnecting\u{2026}" : "Reconnect Wheel") {
@@ -93,9 +82,9 @@ private struct MenuContent: View {
     /// Accessory apps don't show ordinary windows, so switch to a regular
     /// activation policy to present and focus a window. AppDelegate restores
     /// .accessory once all content windows close.
-    private func present(_ windowID: String) {
+    private func presentSettings() {
         NSApp.setActivationPolicy(.regular)
-        openWindow(id: windowID)
+        openSettings()
         NSApp.activate(ignoringOtherApps: true)
     }
 }
@@ -105,17 +94,16 @@ private struct MenuContent: View {
 /// StateObject, so we hook termination explicitly.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Keep proxies installed next to games in sync with the app's bundled
-        // DLL — e.g. after the app updates to a newer version.
-        DispatchQueue.global(qos: .utility).async {
-            CrossOver.refreshInstalledProxies()
-        }
-
         // Check GitHub for a newer release (notify-only).
         UpdateChecker.shared.check()
 
         // The VR streamer runs while VR is on and a game is rendering in VR.
         StreamerController.shared.follow(BridgeController.shared, VRSettings.shared)
+        // A Steam Link headset pairing for the first time asks for its PIN.
+        PairingWindow.shared.follow(StreamerController.shared)
+
+        // Keeps Steam's compatibility tool in step with the settings.
+        SteamIntegration.shared.start()
 
         // Drop back to accessory (no Dock icon) once the user closes our windows.
         // Done here rather than per-view onDisappear, which doesn't fire reliably.

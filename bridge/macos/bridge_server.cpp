@@ -1,6 +1,5 @@
 #include "bridge_server.hpp"
-#include "wheel_registry.hpp"
-#include "utilities.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -25,11 +24,23 @@ os_log_t bridge_log() {
     return log;
 }
 
-// After a wheel is hot-plugged, give macOS and the wheel's firmware time to
-// finish their own power-on initialization before we open and calibrate it.
-// Taking over mid-initialization can leave the wheel in a state other apps
-// (e.g. CrossOver) then fail to detect. See process_pending_device_change.
+// After a wheel is plugged in, give macOS and the wheel's firmware time to
+// finish their own start before taking it. Taking it mid-start can leave the
+// wheel in a state other apps (CrossOver) then fail to detect.
 constexpr std::chrono::milliseconds kHotplugConnectGrace{5000};
+
+// How often the game's state is played to the wheel. WheelSession plays it on
+// at the wheel's own rate in between, and fades the wheel out if nothing is
+// set for a while, so it's set on every tick whether or not it changed.
+constexpr std::chrono::milliseconds kTick{10};
+
+// How often to look for a wheel while none is open.
+constexpr std::chrono::milliseconds kLookInterval{1000};
+
+// The self-test: a pulse each way, then the rev lights swept once.
+constexpr std::chrono::milliseconds kSelfTestPulse{150};
+constexpr std::chrono::milliseconds kSelfTestLength{700};
+constexpr double kSelfTestForce = 0.3;
 
 // A socket timeout (SO_RCVTIMEO/SO_SNDTIMEO) or signal interrupt is not a
 // failure — the peer may just be idle between messages. We keep waiting unless
@@ -125,17 +136,9 @@ void close_if_open(int& fd) {
 
 }  // namespace
 
-BridgeServer::BridgeServer(std::uint16_t port)
-    : port_(port), stop_requested_(false), listen_fd_(-1), device_manager_() {
+BridgeServer::BridgeServer(std::uint16_t port) : port_(port) {
     status_.port = port_;
-    status_.wheel_name = "Starting wheel service...";
-
-    // Hotplug: the handler runs on the main run loop, so just record that a
-    // change happened (no HID work here). The server thread debounces and
-    // reconciles once changes settle.
-    device_manager_.set_device_change_handler([this]() {
-        device_change_seq_.fetch_add(1, std::memory_order_relaxed);
-    });
+    status_.wheel_name = "Looking for a wheel...";
 }
 
 BridgeServer::~BridgeServer() {
@@ -172,11 +175,14 @@ bool BridgeServer::start() {
     }
 
     // Create the listening socket synchronously here, before the worker thread
-    // exists, so stop() always observes a valid (or -1) listen_fd_ and there is
-    // no race over who creates it.
+    // exists, so stop() always observes a valid (or -1) listen_fd_.
     if (!open_listen_socket()) {
         return false;
     }
+
+    // Wheels plugged in starting in another mode (a G923 in Xbox mode) are
+    // switched to their own as they arrive, on the main run loop.
+    WheelOutput::watch();
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -191,8 +197,7 @@ bool BridgeServer::start() {
 void BridgeServer::stop() {
     stop_requested_.store(true);
 
-    // Interrupt a blocking select()/accept() on the worker thread. The worker
-    // only ever reads listen_fd_; this thread closes it after the join.
+    // Interrupt a blocking select()/accept() on the worker thread.
     if (listen_fd_ >= 0) {
         shutdown(listen_fd_, SHUT_RDWR);
     }
@@ -203,146 +208,62 @@ void BridgeServer::stop() {
 
     close_if_open(listen_fd_);
 
+    {
+        std::lock_guard<std::mutex> wheel(wheel_mutex_);
+        session_.close();
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     status_.listening = false;
     status_.client_connected = false;
     status_.client_name.clear();
-    stop_wheel_forces_locked();
-    disconnect_wheel_locked();
+    status_.wheel_connected = false;
+    state_.reset();
 }
 
 bool BridgeServer::reconnect_wheel() {
-    return complete_wheel_connect_cycle(true);
+    std::lock_guard<std::mutex> wheel(wheel_mutex_);
+    session_.close();
+    const bool opened = session_.open();
+    const std::optional<FoundWheel> found = session_.wheel();
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_.wheel_connected = opened;
+    status_.wheel_name = opened && found ? found->name : "No supported wheel detected";
+    return opened;
 }
 
-// The tuning setters just store the value; each driver notices the change on the
-// next apply_state and re-applies, so a tweak takes effect on the next packet.
 void BridgeServer::set_force_gain(double gain) {
     std::lock_guard<std::mutex> lock(mutex_);
-    force_gain_ = std::max(0.0, std::min(2.0, gain));
+    tuning_.force_gain = std::clamp(gain, 0.0, 2.0);
 }
 
 void BridgeServer::set_spring_gain(double gain) {
     std::lock_guard<std::mutex> lock(mutex_);
-    spring_gain_ = std::max(0.0, std::min(2.0, gain));
+    tuning_.spring_gain = std::clamp(gain, 0.0, 2.0);
 }
 
 void BridgeServer::set_damper_gain(double gain) {
     std::lock_guard<std::mutex> lock(mutex_);
-    damper_gain_ = std::max(0.0, std::min(2.0, gain));
+    tuning_.damper_gain = std::clamp(gain, 0.0, 2.0);
 }
 
 void BridgeServer::set_smoothing(double amount) {
     std::lock_guard<std::mutex> lock(mutex_);
-    smoothing_ = std::max(0.0, std::min(1.0, amount));
+    tuning_.smoothing = std::clamp(amount, 0.0, 1.0);
 }
 
 void BridgeServer::set_min_force(double fraction) {
     std::lock_guard<std::mutex> lock(mutex_);
-    min_force_ = std::max(0.0, std::min(0.5, fraction));
+    tuning_.min_force = std::clamp(fraction, 0.0, 0.5);
 }
 
 void BridgeServer::run_self_test() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (wheels_.empty() || wheel_operation_in_progress_) {
-        return;
-    }
-
-    for (auto& wheel : wheels_) {
-        if (wheel && wheel->is_initialized()) {
-            wheel->self_test();
-        }
-    }
-}
-
-void BridgeServer::handle_device_change() {
-    bool have_wheel = false;
-    std::vector<hid_device_t*> connected_devices;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (wheel_operation_in_progress_) {
-            return;
-        }
-        have_wheel = !wheels_.empty();
-        for (const auto& wheel : wheels_) {
-            if (wheel) {
-                connected_devices.push_back(wheel->device().raw_device());
-            }
-        }
-    }
-
-    // A matching device was attached or removed; reconcile our connection state.
-    const auto present = device_manager_.find_known_wheels();
-    if (present.empty()) {
-        if (have_wheel) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            disconnect_wheel_locked();
-            status_.wheel_name = "Wheel disconnected";
-        }
-        return;
-    }
-
-    if (!have_wheel) {
-        complete_wheel_connect_cycle(false);
-        return;
-    }
-
-    const bool all_connected_interfaces_still_present = std::all_of(
-        connected_devices.begin(),
-        connected_devices.end(),
-        [&present](hid_device_t* connected_device) {
-            return connected_device && std::any_of(
-                present.begin(),
-                present.end(),
-                [connected_device](const HidDevice& device) {
-                    return device.raw_device() == connected_device;
-                });
-        });
-
-    if (!all_connected_interfaces_still_present) {
-        complete_wheel_connect_cycle(true);
-    }
-}
-
-void BridgeServer::process_pending_device_change() {
-    const std::uint64_t change_seq = device_change_seq_.load(std::memory_order_relaxed);
-    if (change_seq == handled_change_seq_) {
-        return;
-    }
-
-    if (change_seq != last_seen_change_seq_) {
-        // New device events are still arriving; note them (and when they began)
-        // and wait for the bus to settle before reconciling.
-        last_seen_change_seq_ = change_seq;
-        device_change_observed_at_ = std::chrono::steady_clock::now();
-        return;
-    }
-
-    // The change sequence has been quiet for an iteration. When this is a fresh
-    // connect (we currently hold no wheel), hold off a little longer: the moment
-    // a wheel is plugged in, macOS and the wheel's own firmware run a power-on
-    // initialization, and opening/calibrating it mid-initialization can leave the
-    // wheel in a state other apps (e.g. CrossOver) then fail to detect. Let that
-    // finish first. Removals/reconnects (we already hold a wheel) are handled
-    // promptly. Tune kHotplugConnectGrace if a wheel needs more or less time.
-    bool connecting = false;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        connecting = wheels_.empty();
-    }
-    if (connecting &&
-        (std::chrono::steady_clock::now() - device_change_observed_at_) < kHotplugConnectGrace) {
-        return;  // defer; re-checked on the next loop iteration
-    }
-
-    handled_change_seq_ = change_seq;
-    handle_device_change();
+    self_test_requested_.store(true);
+    std::this_thread::sleep_for(kSelfTestLength);
 }
 
 BridgeServer::Status BridgeServer::status() const {
-    // Don't block the caller (the UI status poll) if the worker thread is mid
-    // wheel update holding mutex_ across HID I/O. Refresh the cache when we can
-    // take the lock; otherwise return the last snapshot.
+    // Don't block the caller (the UI's status poll) on the server thread.
     std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
     if (lock.owns_lock()) {
         cached_status_ = status_;
@@ -351,184 +272,137 @@ BridgeServer::Status BridgeServer::status() const {
     return cached_status_;
 }
 
-BridgeServer::WheelConnectResult BridgeServer::ensure_wheel_connected() {
-    {
+void BridgeServer::keep_wheel_open(Clock::time_point now) {
+    std::unique_lock<std::mutex> wheel(wheel_mutex_, std::try_to_lock);
+    if (!wheel.owns_lock() || session_.is_open() || now < next_look_) {
+        return;  // a reconnect is under way, or there's nothing to do yet
+    }
+    next_look_ = now + kLookInterval;
+
+    if (session_.wheel()) {
+        // It was open and stopped answering: unplugged.
+        session_.close();
+        os_log(bridge_log(), "the wheel stopped answering");
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!wheels_.empty()) {
-            status_.wheel_connected = true;
-            return WheelConnectResult::connected;
-        }
-
-        if (wheel_operation_in_progress_) {
-            return WheelConnectResult::busy;
-        }
+        status_.wheel_connected = false;
+        status_.wheel_name = "Wheel disconnected";
     }
 
-    if (complete_wheel_connect_cycle(false)) {
-        return WheelConnectResult::connected;
-    }
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    return wheel_operation_in_progress_ ? WheelConnectResult::busy : WheelConnectResult::unavailable;
-}
-
-bool BridgeServer::complete_wheel_connect_cycle(bool force_reconnect) {
-    std::vector<std::unique_ptr<WheelDriver>> previous_wheels;
-
-    {
+    const std::optional<FoundWheel> found = session_.find_wheel();
+    const bool first_look = !looked_;
+    looked_ = true;
+    if (!found) {
+        wheel_seen_at_.reset();
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!force_reconnect && !wheels_.empty()) {
-            status_.wheel_connected = true;
-            if (status_.wheel_name.empty()) {
-                status_.wheel_name = "Supported wheel connected";
-            }
-            return true;
+        if (status_.wheel_name != "Wheel disconnected") {
+            status_.wheel_name = "No supported wheel detected";
         }
-
-        if (wheel_operation_in_progress_) {
-            return false;
-        }
-
-        begin_wheel_operation_locked(force_reconnect ? "Reconnecting wheel..." : "Connecting to wheel...");
-        if (force_reconnect) {
-            previous_wheels = std::move(wheels_);
-        }
+        return;
     }
 
-    previous_wheels.clear();
-
-    auto wheels = device_manager_.find_known_wheels();
-    if (wheels.empty()) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        finish_wheel_operation_locked({}, "No supported wheel detected");
-        return false;
-    }
-
-    // Open only interfaces that can receive our FFB output reports, so the
-    // wheel's input-only interface is left free for the game (CrossOver) to
-    // claim. Fall back to every interface if none advertise output, so FFB is
-    // never lost to an overly-strict filter.
-    std::vector<HidDevice> ffb_interfaces;
-    for (const auto& device : wheels) {
-        if (device.max_output_report_size() > 0) {
-            ffb_interfaces.push_back(device);
+    // One there as Wheelio starts is taken at once; one plugged in later is
+    // given its grace first.
+    if (!first_look) {
+        if (!wheel_seen_at_) {
+            wheel_seen_at_ = now;
         }
-    }
-    const std::vector<HidDevice>& candidates = ffb_interfaces.empty() ? wheels : ffb_interfaces;
-
-    std::vector<std::unique_ptr<WheelDriver>> initialized_wheels;
-    std::vector<std::string> initialized_names;
-    std::vector<std::string> unsupported_names;
-    bool saw_supported_profile = false;
-
-    for (const auto& device : candidates) {
-        const WheelProfile* profile = device.profile();
-        if (!profile) {
-            continue;
-        }
-
-        if (!profile->force_feedback_supported) {
-            unsupported_names.emplace_back(profile->name);
-            continue;
-        }
-
-        saw_supported_profile = true;
-        auto controller = wheel_registry::create_driver(device);
-        if (!controller || !controller->initialize()) {
-            continue;
-        }
-
-        {
+        if (now - *wheel_seen_at_ < kHotplugConnectGrace) {
             std::lock_guard<std::mutex> lock(mutex_);
-            status_.wheel_name = "Calibrating " + std::string(profile->name) + "...";
+            status_.wheel_name = "Connecting to " + found->name + "...";
+            return;
         }
-
-        if (device.uses_startup_calibration() && !controller->calibrate()) {
-            continue;
-        }
-        initialized_names.emplace_back(profile->name);
-        initialized_wheels.push_back(std::move(controller));
     }
+
+    const bool opened = session_.open();
+    wheel_seen_at_.reset();
+    smoothing_.reset();
+    if (opened) {
+        os_log(bridge_log(), "opened %{public}s (%{public}s)", found->name.c_str(), found->family.c_str());
+    } else {
+        os_log_error(bridge_log(), "couldn't open %{public}s; trying again", found->name.c_str());
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_.wheel_connected = opened;
+    status_.wheel_name = opened ? found->name : "Couldn't connect to " + found->name;
+}
+
+void BridgeServer::play(Clock::time_point now) {
+    if (!session_.is_open()) {
+        return;
+    }
+
+    const double seconds = last_played_ == Clock::time_point{}
+                               ? 0.0
+                               : std::chrono::duration<double>(now - last_played_).count();
+    last_played_ = now;
+    WheelForces forces;
+    double smoothing = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_) {
+            forces = map_wheel_state(*state_, tuning_);
+        }
+        smoothing = tuning_.smoothing;
+    }
+    double force = smoothing_.step(forces.force, seconds, smoothing);
+    std::uint32_t leds = 0;
+
+    if (self_test_requested_.exchange(false)) {
+        self_test_started_ = now;
+    }
+    if (self_test_started_) {
+        const auto elapsed = now - *self_test_started_;
+        if (elapsed < kSelfTestLength) {
+            if (elapsed < kSelfTestPulse) {
+                force = kSelfTestForce;
+            } else if (elapsed < 2 * kSelfTestPulse) {
+                force = -kSelfTestForce;
+            }
+            leds = WheelSession::rev_lights(std::chrono::duration<double>(elapsed) / kSelfTestLength);
+        } else {
+            self_test_started_.reset();
+        }
+    }
+
+    session_.set_force(force);
+    if (forces.spring) {
+        session_.set_spring(*forces.spring);
+    } else {
+        session_.clear_spring();
+    }
+    session_.set_damper(forces.damper);
+    session_.set_friction(forces.friction);
+    session_.set_leds(leds);
+}
+
+void BridgeServer::tick() {
+    const Clock::time_point now = Clock::now();
+    if (last_tick_ != Clock::time_point{} && now - last_tick_ < kTick) {
+        return;
+    }
+    keep_wheel_open(now);
+    play(now);
+    last_tick_ = now;
 
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!initialized_wheels.empty()) {
-        const std::string base_name = initialized_names.empty() ? "Supported wheel" : initialized_names.front();
-        const std::string wheel_name = initialized_wheels.size() > 1
-                                           ? base_name + " (" + std::to_string(initialized_wheels.size()) + " interfaces)"
-                                           : base_name;
-        finish_wheel_operation_locked(std::move(initialized_wheels), wheel_name);
-        return true;
-    }
-
-    if (!saw_supported_profile && !unsupported_names.empty()) {
-        const std::string wheel_name = unsupported_names.size() == 1
-                                           ? unsupported_names.front() + " detected (unsupported)"
-                                           : "Unsupported wheels detected";
-        finish_wheel_operation_locked({}, wheel_name);
-        return false;
-    }
-
-    finish_wheel_operation_locked({}, "Failed to calibrate supported wheel");
-    return false;
-}
-
-void BridgeServer::begin_wheel_operation_locked(const std::string& status_text) {
-    wheel_operation_in_progress_ = true;
-    status_.wheel_connected = false;
-    status_.wheel_name = status_text;
-}
-
-void BridgeServer::finish_wheel_operation_locked(std::vector<std::unique_ptr<WheelDriver>> wheels,
-                                                 const std::string& status_text) {
-    wheels_ = std::move(wheels);
-    wheel_operation_in_progress_ = false;
-    status_.wheel_connected = !wheels_.empty();
-    status_.wheel_name = status_text;
-    // A freshly opened wheel holds no forces; the game's last state goes back on.
-    desired_.redeliver();
-}
-
-void BridgeServer::disconnect_wheel_locked() {
-    wheels_.clear();
-    wheel_operation_in_progress_ = false;
-    status_.wheel_connected = false;
-    if (status_.wheel_name.empty()) {
-        status_.wheel_name = "Disconnected";
-    }
-}
-
-void BridgeServer::stop_wheel_forces_locked() {
-    // Each driver's stop_forces() performs the full release and resets its own
-    // change-tracking, so the next game packet re-applies cleanly.
-    for (auto& wheel : wheels_) {
-        if (wheel && wheel->is_initialized()) {
-            wheel->stop_forces();
-        }
-    }
+    status_.wheel_connected = session_.is_open();
+    log_ffb_summary_locked(false);
 }
 
 void BridgeServer::server_loop() {
-    // This thread receives FFB updates and writes them to the wheel, so give it
-    // the highest QoS for prompt scheduling (low force-feedback latency).
+    // This thread plays the game's forces to the wheel, so give it the highest
+    // QoS for prompt scheduling.
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 
-    // listen_fd_ was created in start() before this thread was spawned, and is
-    // closed by stop() after this thread joins, so it is valid for the whole
-    // loop and this thread never needs to mutate it.
-    complete_wheel_connect_cycle(false);
-
     while (!stop_requested_.load()) {
-        // Debounced hotplug reconciliation also runs inside run_client_session,
-        // so wheel attach/removal is handled even while a game keeps a socket open.
-        process_pending_device_change();
+        tick();
 
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(listen_fd_, &read_fds);
 
         timeval timeout{};
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 250000;
+        timeout.tv_usec = std::chrono::duration_cast<std::chrono::microseconds>(kTick).count();
 
         const int ready = select(listen_fd_ + 1, &read_fds, nullptr, nullptr, &timeout);
         if (ready < 0) {
@@ -564,27 +438,22 @@ void BridgeServer::server_loop() {
         std::lock_guard<std::mutex> lock(mutex_);
         log_ffb_summary_locked(true);
         os_log(bridge_log(), "game disconnected; forces stopped");
-        desired_.clear();
-        apply_failing_ = false;
+        state_.reset();
         status_.client_connected = false;
         status_.client_name.clear();
-        stop_wheel_forces_locked();
     }
-
-    // listen_fd_ is closed by stop() after this thread joins.
 }
 
 void BridgeServer::run_client_session(int client_fd) {
     while (!stop_requested_.load()) {
-        process_pending_device_change();
+        tick();
 
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(client_fd, &read_fds);
 
         timeval timeout{};
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 250000;
+        timeout.tv_usec = std::chrono::duration_cast<std::chrono::microseconds>(kTick).count();
 
         const int ready = select(client_fd + 1, &read_fds, nullptr, nullptr, &timeout);
         if (ready < 0) {
@@ -594,9 +463,6 @@ void BridgeServer::run_client_session(int client_fd) {
             break;
         }
         if (ready == 0) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            deliver_desired_state_locked();
-            log_ffb_summary_locked(false);
             continue;
         }
 
@@ -627,10 +493,6 @@ void BridgeServer::run_client_session(int client_fd) {
                          static_cast<unsigned>(header.type));
             break;
         }
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        deliver_desired_state_locked();
-        log_ffb_summary_locked(false);
     }
 }
 
@@ -648,9 +510,9 @@ bool BridgeServer::handle_message(int client_fd, const wheelio_bridge::MessageHe
 
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                status_.client_name = payload.client_name;
                 char name[sizeof(payload.client_name) + 1] = {};
                 std::memcpy(name, payload.client_name, sizeof(payload.client_name));
+                status_.client_name = name;
                 os_log(bridge_log(), "hello from %{public}s pid=%u; wheel_connected=%d wheel=%{public}s", name,
                        static_cast<unsigned>(payload.process_id), status_.wheel_connected ? 1 : 0,
                        status_.wheel_name.c_str());
@@ -669,26 +531,16 @@ bool BridgeServer::handle_message(int client_fd, const wheelio_bridge::MessageHe
                 return false;
             }
 
-            const auto connect_result = ensure_wheel_connected();
-            std::lock_guard<std::mutex> lock(mutex_);
-            ++ffb_counters_.received;
-            ffb_counters_.last = payload;
-            desired_.set(payload);
-            // The game stays connected whatever happens to the wheel; the
-            // state is applied once a wheel can take it.
-            if (connect_result == WheelConnectResult::unavailable) {
-                if (!apply_failing_) {
-                    os_log_error(bridge_log(), "force update with no wheel available (%{public}s); "
-                                 "applying it when a wheel connects", status_.wheel_name.c_str());
-                    apply_failing_ = true;
-                }
-                return true;
+            // Played now, and every tick after it until the game changes it,
+            // whether or not a wheel is there yet.
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                state_ = payload;
+                ++ffb_counters_.received;
+                ffb_counters_.last = payload;
+                ++status_.packets_received;
             }
-            if (connect_result == WheelConnectResult::busy) {
-                ++ffb_counters_.skipped_busy;
-                return true;
-            }
-            deliver_desired_state_locked();
+            play(Clock::now());
             return true;
         }
 
@@ -697,41 +549,18 @@ bool BridgeServer::handle_message(int client_fd, const wheelio_bridge::MessageHe
                 return false;
             }
 
-            std::lock_guard<std::mutex> lock(mutex_);
-            desired_.clear();
-            stop_wheel_forces_locked();
-            ++ffb_counters_.stops;
-            ++status_.packets_received;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                state_.reset();
+                ++ffb_counters_.stops;
+                ++status_.packets_received;
+            }
+            play(Clock::now());
             return true;
         }
 
         case wheelio_bridge::MessageType::ping: {
-            if (header.payload_size > 0 && !discard_exact(client_fd, header.payload_size, stop_requested_)) {
-                return false;
-            }
-            return true;
-        }
-
-        case wheelio_bridge::MessageType::set_led_pattern: {
-            if (header.payload_size != sizeof(wheelio_bridge::LedPatternPayload)) {
-                return false;
-            }
-
-            wheelio_bridge::LedPatternPayload payload{};
-            if (!recv_exact(client_fd, &payload, sizeof(payload), stop_requested_)) {
-                return false;
-            }
-
-            const auto connect_result = ensure_wheel_connected();
-            if (connect_result == WheelConnectResult::unavailable) {
-                return false;
-            }
-            if (connect_result == WheelConnectResult::busy) {
-                return true;
-            }
-
-            std::lock_guard<std::mutex> lock(mutex_);
-            return apply_led_pattern_locked(payload.pattern);
+            return header.payload_size == 0 || discard_exact(client_fd, header.payload_size, stop_requested_);
         }
 
         default:
@@ -755,68 +584,14 @@ bool BridgeServer::send_hello_ack(int client_fd) {
     header.payload_size = sizeof(payload);
 
     return send_exact(client_fd, &header, sizeof(header), stop_requested_) &&
-            send_exact(client_fd, &payload, sizeof(payload), stop_requested_);
-}
-
-bool BridgeServer::apply_wheel_state_locked(const wheelio_bridge::WheelStatePayload& payload) {
-    if (wheel_operation_in_progress_) {
-        // Calibrating or reconnecting: not applied, so it stays pending.
-        ++ffb_counters_.skipped_busy;
-        return false;
-    }
-
-    if (wheels_.empty()) {
-        status_.wheel_connected = false;
-        return false;
-    }
-
-    // Hand the generic state + user tuning to each driver; the driver owns all
-    // manufacturer-specific mapping, change-detection and report encoding.
-    const FfbTuning tuning{force_gain_, spring_gain_, damper_gain_, smoothing_, min_force_};
-    bool applied_to_any_wheel = false;
-    for (auto& wheel : wheels_) {
-        if (wheel && wheel->is_initialized() && wheel->apply_state(payload, tuning)) {
-            applied_to_any_wheel = true;
-        }
-    }
-
-    if (!applied_to_any_wheel) {
-        ++ffb_counters_.failed;
-        if (!apply_failing_) {
-            os_log_error(bridge_log(), "no wheel accepted the force update (%zu open, initialised=%d); "
-                         "retrying", wheels_.size(),
-                         wheels_.front() && wheels_.front()->is_initialized() ? 1 : 0);
-            apply_failing_ = true;
-        }
-        status_.wheel_connected = false;
-        return false;
-    }
-
-    if (apply_failing_) {
-        os_log(bridge_log(), "force updates reach the wheel again");
-        apply_failing_ = false;
-    }
-    ++ffb_counters_.applied;
-    ++status_.packets_received;
-    return true;
-}
-
-// Applies the game's last state if it hasn't reached the wheel yet and a wheel
-// can take it; called on each new state and on the session's idle ticks.
-void BridgeServer::deliver_desired_state_locked() {
-    if (!desired_.needs_delivery() || wheels_.empty() || wheel_operation_in_progress_) {
-        return;
-    }
-    if (apply_wheel_state_locked(desired_.state())) {
-        desired_.delivered();
-    }
+           send_exact(client_fd, &payload, sizeof(payload), stop_requested_);
 }
 
 // Once a second while force updates arrive (or when forced at disconnect):
-// what came in, what reached the wheel and the last state, with the tuning
-// that maps it, so the game's force range can be read off a session.
+// what came in and the last state, with the settings that map it, so the
+// game's force range can be read off a session.
 void BridgeServer::log_ffb_summary_locked(bool force) {
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = Clock::now();
     const auto& c = ffb_counters_;
     if (c.received == 0 && c.stops == 0) {
         return;
@@ -825,35 +600,17 @@ void BridgeServer::log_ffb_summary_locked(bool force) {
         return;
     }
     os_log(bridge_log(),
-           "ffb: received=%u applied=%u skipped_busy=%u failed=%u stops=%u | last constant=%d mag=%d "
-           "spring=%d k=%u/%u clip=%u damper=%d autocenter=%d | gain=%.2f spring_gain=%.2f "
-           "damper_gain=%.2f min_force=%.2f smoothing=%.2f",
-           c.received, c.applied, c.skipped_busy, c.failed, c.stops, c.last.constant_force_enabled,
-           static_cast<int>(c.last.constant_force_magnitude), c.last.custom_spring_enabled,
-           static_cast<unsigned>(c.last.spring_k1), static_cast<unsigned>(c.last.spring_k2),
-           static_cast<unsigned>(c.last.spring_clip), c.last.damper_enabled, c.last.autocenter_enabled,
-           force_gain_, spring_gain_, damper_gain_, min_force_, smoothing_);
+           "ffb: received=%u stops=%u wheel=%d | last constant=%d spring=%d offset=%d deadband=%u k=%d/%d "
+           "sat=%u/%u damper=%u friction=%u | gain=%.2f spring_gain=%.2f damper_gain=%.2f min_force=%.2f "
+           "smoothing=%.2f",
+           c.received, c.stops, status_.wheel_connected ? 1 : 0, static_cast<int>(c.last.constant_force),
+           c.last.spring_enabled, static_cast<int>(c.last.spring_offset),
+           static_cast<unsigned>(c.last.spring_deadband), static_cast<int>(c.last.spring_positive_coefficient),
+           static_cast<int>(c.last.spring_negative_coefficient),
+           static_cast<unsigned>(c.last.spring_positive_saturation),
+           static_cast<unsigned>(c.last.spring_negative_saturation), static_cast<unsigned>(c.last.damper),
+           static_cast<unsigned>(c.last.friction), tuning_.force_gain, tuning_.spring_gain, tuning_.damper_gain,
+           tuning_.min_force, tuning_.smoothing);
     ffb_counters_ = FfbCounters{};
     last_ffb_summary_ = now;
-}
-
-bool BridgeServer::apply_led_pattern_locked(std::uint8_t pattern) {
-    if (wheel_operation_in_progress_) {
-        return true;
-    }
-
-    if (wheels_.empty()) {
-        status_.wheel_connected = false;
-        return false;
-    }
-
-    bool applied = false;
-    for (auto& wheel : wheels_) {
-        if (wheel && wheel->is_initialized()) {
-            applied = wheel->apply_led_pattern(pattern) || applied;
-        }
-    }
-
-    ++status_.packets_received;
-    return applied;
 }

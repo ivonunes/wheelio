@@ -1,0 +1,102 @@
+name: Release engine
+
+# Run by hand from the Actions tab on main when engine/ has changed. It builds
+# the engine with engine.yml, publishes it as its own GitHub release
+# (engine-<version>, never marked latest, so the app's update check ignores
+# it), then opens a pull request for app/engine-release.json: the engine the
+# next Wheelio release pins, with the git tree of engine/ it was built from.
+# release.yml refuses to release the app while engine/ differs from that tree.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-engine
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check the branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate
+        run: |
+          if [[ "${GITHUB_REF_NAME}" != "main" ]]; then
+            echo "::error::Release the engine from main (this run is on ${GITHUB_REF_NAME})." >&2
+            exit 1
+          fi
+
+  build:
+    name: Build
+    needs: check
+    uses: ./.github/workflows/engine.yml
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    # The deploy key's push starts the pin's pull request checks, which a
+    # push with the workflow's own token wouldn't.
+    environment: updates
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ssh-key: ${{ secrets.UPDATES_DEPLOY_KEY }}
+
+      - name: Download the engine
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: wheelio-engine-x86_64
+          path: ${{ runner.temp }}/engine
+
+      - name: Publish the release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/engine"
+          tarball="$(ls wheelio-engine-*-x86_64.tar.xz)"
+          version="${tarball#wheelio-engine-}"
+          version="${version%-x86_64.tar.xz}"
+          tag="engine-${version}"
+          if git -C "$GITHUB_WORKSPACE" ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+            echo "::error::${tag} is already released. Bump ENGINE_REVISION in engine/build.sh for a new engine." >&2
+            exit 1
+          fi
+          shasum -a 256 "$tarball" > "wheelio-${tag}-SHA256SUMS"
+          gh release create "$tag" "$tarball" "wheelio-${tag}-SHA256SUMS" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --latest=false \
+            --title "Wheelio engine ${version}" \
+            --notes "The Wine engine Wheelio runs games on, built from engine/ at ${GITHUB_SHA}. The app downloads it itself."
+          {
+            echo "version=${version}"
+            echo "sha256=$(cut -d' ' -f1 "wheelio-${tag}-SHA256SUMS")"
+            echo "url=https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${tarball}"
+          } >>"$GITHUB_OUTPUT"
+
+      # main is protected, so the pin goes in by pull request. The engine/ tree
+      # is the commit's the engine was built from.
+      - name: Open the pin's pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.publish.outputs.version }}
+          SHA256: ${{ steps.publish.outputs.sha256 }}
+          URL: ${{ steps.publish.outputs.url }}
+        run: |
+          set -euo pipefail
+          source="$(git rev-parse HEAD:engine)"
+          jq -n --arg version "$VERSION" --arg url "$URL" --arg sha256 "$SHA256" --arg source "$source" \
+            '{version: $version, url: $url, sha256: $sha256, source: $source}' >app/engine-release.json
+          printf 'Pins the engine released as [engine-%s](https://github.com/%s/releases/tag/engine-%s).\n' \
+            "$VERSION" "$GITHUB_REPOSITORY" "$VERSION" >"$RUNNER_TEMP/pr-body.md"
+          scripts/open-update-pr.sh engine-release "Release engine ${VERSION}" "$RUNNER_TEMP/pr-body.md"

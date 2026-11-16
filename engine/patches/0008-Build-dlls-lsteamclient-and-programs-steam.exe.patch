@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ivo Nunes <ivo@nunes.uk>
+Date: Mon, 16 Nov 2026 11:50:33 +0000
+Subject: [PATCH] Build dlls/lsteamclient and programs/steam.exe.
+
+Wheelio: registers Valve's lsteamclient and Proton's steam helper with
+Wine's build, so they are built and installed like any other module.
+engine/build.sh puts their sources in place before configure runs.
+configure is patched alongside configure.ac so the build doesn't need
+autoconf.
+
+Origin: Wheelio, after NotProton's bridge/register-components.diff.
+---
+ configure    | 4 ++++
+ configure.ac | 2 ++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/configure b/configure
+index 26e224a..5269f2d 100755
+--- a/configure
++++ b/configure
+@@ -1225,6 +1225,7 @@ enable_light_msstyles
+ enable_loadperf
+ enable_localspl
+ enable_localui
++enable_lsteamclient
+ enable_lz32
+ enable_magnification
+ enable_mapi32
+@@ -1752,6 +1753,7 @@ enable_shutdown
+ enable_sort
+ enable_spoolsv
+ enable_start
++enable_steam_exe
+ enable_subst
+ enable_svchost
+ enable_systeminfo
+@@ -22863,6 +22865,7 @@ wine_fn_config_makefile dlls/loadperf enable_loadperf
+ wine_fn_config_makefile dlls/localspl enable_localspl
+ wine_fn_config_makefile dlls/localspl/tests enable_tests
+ wine_fn_config_makefile dlls/localui enable_localui
++wine_fn_config_makefile dlls/lsteamclient enable_lsteamclient
+ wine_fn_config_makefile dlls/localui/tests enable_tests
+ wine_fn_config_makefile dlls/lz32 enable_lz32
+ wine_fn_config_makefile dlls/lz32/tests enable_tests
+@@ -23640,6 +23643,7 @@ wine_fn_config_makefile programs/shutdown enable_shutdown
+ wine_fn_config_makefile programs/sort enable_sort
+ wine_fn_config_makefile programs/spoolsv enable_spoolsv
+ wine_fn_config_makefile programs/start enable_start
++wine_fn_config_makefile programs/steam.exe enable_steam_exe
+ wine_fn_config_makefile programs/subst enable_subst
+ wine_fn_config_makefile programs/svchost enable_svchost
+ wine_fn_config_makefile programs/systeminfo enable_systeminfo
+diff --git a/configure.ac b/configure.ac
+index bf8e3c0..fc7f5fb 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2860,6 +2860,7 @@ WINE_CONFIG_MAKEFILE(dlls/loadperf)
+ WINE_CONFIG_MAKEFILE(dlls/localspl)
+ WINE_CONFIG_MAKEFILE(dlls/localspl/tests)
+ WINE_CONFIG_MAKEFILE(dlls/localui)
++WINE_CONFIG_MAKEFILE(dlls/lsteamclient)
+ WINE_CONFIG_MAKEFILE(dlls/localui/tests)
+ WINE_CONFIG_MAKEFILE(dlls/lz32)
+ WINE_CONFIG_MAKEFILE(dlls/lz32/tests)
+@@ -3637,6 +3638,7 @@ WINE_CONFIG_MAKEFILE(programs/shutdown)
+ WINE_CONFIG_MAKEFILE(programs/sort)
+ WINE_CONFIG_MAKEFILE(programs/spoolsv)
+ WINE_CONFIG_MAKEFILE(programs/start)
++WINE_CONFIG_MAKEFILE(programs/steam.exe)
+ WINE_CONFIG_MAKEFILE(programs/subst)
+ WINE_CONFIG_MAKEFILE(programs/svchost)
+ WINE_CONFIG_MAKEFILE(programs/systeminfo)

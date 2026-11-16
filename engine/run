@@ -1,0 +1,389 @@
+#!/bin/bash
+# Wheelio's Steam Play compatibility tool. Steam runs it as
+#
+#   run <verb> [command...]
+#
+# with the usual compatibility tool environment (STEAM_COMPAT_DATA_PATH,
+# STEAM_COMPAT_CLIENT_INSTALL_PATH, SteamAppId, ...). The game's Wine prefix
+# is $STEAM_COMPAT_DATA_PATH/pfx with a "steamuser" user, as on Proton, which
+# is where Steam Cloud looks for Windows saves. Wheelio's wrapper adds:
+#
+#   WHEELIO_SUPPORT   the folder with dinput8.dll, dinput8_x86.dll,
+#                     wheelio_openxr.dll and wheelio_openxr.json
+#   WHEELIO_D3DMETAL  a copy of Apple's Game Porting Toolkit redist/lib folder,
+#                     when the person has installed it
+set -u
+
+engine=$(cd "$(dirname "$0")" && pwd)
+# x86_64 engines run under Rosetta; arm64 ones natively, with 64-bit Windows
+# code in ARM64EC folders.
+if [ -d "$engine/lib/wine/aarch64-unix" ]; then
+    wine=$engine/lib/wine/aarch64-unix/wine
+    builtin_folders="system32:aarch64-windows syswow64:i386-windows"
+else
+    wine=$engine/lib/wine/x86_64-unix/wine
+    builtin_folders="system32:x86_64-windows syswow64:i386-windows"
+fi
+wineserver=$engine/bin/wineserver
+
+fail() {
+    echo "wheelio: $*" >&2
+    exit 1
+}
+
+verb=${1:-}
+[ $# -gt 0 ] && shift
+
+case $verb in
+    run | waitforexitandrun | runinprefix | getcompatpath | getnativepath) ;;
+    *) fail "unknown verb '$verb'" ;;
+esac
+
+# --- The game's Wine environment ---------------------------------------------
+
+[ -n "${STEAM_COMPAT_DATA_PATH:-}" ] || fail "STEAM_COMPAT_DATA_PATH is not set"
+# Steam's compatdata folder. Creating it could put a folder on the internal
+# disk where an unplugged drive should be.
+[ -d "$(dirname "$STEAM_COMPAT_DATA_PATH")" ] || fail "$(dirname "$STEAM_COMPAT_DATA_PATH") is not there. Is its drive connected?"
+
+export WINEPREFIX=$STEAM_COMPAT_DATA_PATH/pfx
+mkdir -p "$WINEPREFIX" || fail "can't create $WINEPREFIX"
+log=$STEAM_COMPAT_DATA_PATH/wheelio.log
+
+# --- Run time environment --------------------------------------------------
+
+# SDL leaves controllers Apple's GameController framework knows (the G923
+# among them) to that framework, which only serves the frontmost app.
+export SDL_JOYSTICK_MFI=0
+# Wine loads FreeType, GnuTLS, SDL and MoltenVK by name; the engine carries
+# its own.
+export DYLD_FALLBACK_LIBRARY_PATH=$engine/lib:/usr/lib
+# Only the engine's GStreamer plugins, scanned in the game's own process (the
+# separate scanner isn't shipped) and remembered between launches.
+export GST_PLUGIN_SYSTEM_PATH_1_0=$engine/lib/gstreamer-1.0 GST_REGISTRY_FORK=no
+engine_version=$(cat "$engine/VERSION")
+export GST_REGISTRY_1_0=$HOME/Library/Caches/Wheelio/gstreamer-$engine_version.bin
+unset GST_PLUGIN_PATH_1_0 GST_PLUGIN_PATH
+mkdir -p "$HOME/Library/Caches/Wheelio"
+# Wine names the Windows user after USER; CrossOver's Wine only does when
+# asked to, and otherwise calls everyone "crossover".
+export USER=steamuser CX_REPORT_REAL_USERNAME=1
+export WINEMSYNC=${WINEMSYNC:-1}
+export ROSETTA_ADVERTISE_AVX=${ROSETTA_ADVERTISE_AVX:-1}
+export WINEDEBUG=${WINEDEBUG:-fixme-all}
+
+# lsteamclient finds the Mac client's steamclient.dylib from here, and the
+# steam helper lists its library folders for the game.
+export STEAM_COMPAT_CLIENT_INSTALL_PATH=${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$HOME/Library/Application Support/Steam}
+
+# Graphics, first match wins: DXVK (Direct3D 9 to 11 on Vulkan) when the
+# game's launch options say WHEELIO_GRAPHICS=dxvk, Apple's D3DMetal (11 and 12)
+# when installed, DXMT (10 and 11), then Wine's own: OpenGL for 9 and older,
+# and vkd3d on MoltenVK for 12. Wine's Direct3D 12 needs Wine's DXGI, which
+# DXMT replaces, so WHEELIO_GRAPHICS=vkd3d leaves DXMT out.
+graphics=${WHEELIO_GRAPHICS:-}
+case $graphics in
+    "" | dxvk | vkd3d) ;;
+    *)
+        graphics_note="wheelio: ignoring WHEELIO_GRAPHICS=$graphics (it can be dxvk or vkd3d)"
+        graphics=
+        ;;
+esac
+dll_path=
+[ "$graphics" = vkd3d ] || dll_path=$engine/lib/dxmt
+if [ -n "${WHEELIO_D3DMETAL:-}" ] && [ -d "$WHEELIO_D3DMETAL/wine" ]; then
+    dll_path=$WHEELIO_D3DMETAL/wine${dll_path:+:$dll_path}
+    export CX_APPLEGPTK_LIBD3DSHARED_PATH=$WHEELIO_D3DMETAL/external/libd3dshared.dylib
+fi
+[ "$graphics" = dxvk ] && dll_path=$engine/lib/dxvk${dll_path:+:$dll_path}
+if [ -n "$dll_path" ]; then export WINEDLLPATH_PREPEND=$dll_path; else unset WINEDLLPATH_PREPEND; fi
+# MoltenVK reports errors only, and DXVK keeps its logs and shader cache out
+# of the game's folder.
+export MVK_CONFIG_LOG_LEVEL=${MVK_CONFIG_LOG_LEVEL:-1}
+export DXVK_LOG_PATH=${DXVK_LOG_PATH:-none}
+export DXVK_STATE_CACHE_PATH=${DXVK_STATE_CACHE_PATH:-$STEAM_COMPAT_DATA_PATH}
+
+# The game's own overrides from its launch options come last, so they win.
+export WINEDLLOVERRIDES="steam.exe=b;dinput8=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+
+# --- Setup -----------------------------------------------------------------
+
+# Gets the prefix ready for this launch.
+prepare_prefix() {
+    setup_prefix
+    link_graphics_modules "$engine/lib/dxmt" "$engine/lib/dxvk" ${WHEELIO_D3DMETAL:+"$WHEELIO_D3DMETAL/wine"}
+}
+
+# Creates the prefix, or updates it when the engine's version or folder has
+# changed. Wine sets up Wine Mono and Wine Gecko from the engine's own copies
+# as part of this.
+setup_prefix() {
+    local engine_id="$engine_version $engine"
+    [ "$(cat "$WINEPREFIX/.wheelio-engine" 2>/dev/null)" = "$engine_id" ] && return
+    relink_builtins
+    # Without the graphics choice, so the prefix holds Wine's own DLLs, which
+    # can be linked.
+    env -u WINEDLLPATH_PREPEND "$wine" wineboot -u >>"$log" 2>&1 || fail "could not set up $WINEPREFIX, see $log"
+    "$wineserver" -w
+    # DLLs that were in use during the update are put in place when Wine next
+    # starts; that has to happen before they're linked.
+    env -u WINEDLLPATH_PREPEND "$wine" wineboot >>"$log" 2>&1
+    "$wineserver" -w
+    setup_user_folders
+    link_builtins
+    echo "$engine_id" >"$WINEPREFIX/.wheelio-engine"
+}
+
+# Wine copies its built-in DLLs into every prefix (about 500 MB). As Proton
+# does, the copies that are still the engine's own are swapped for links to
+# it; anything a game or installer replaced stays. The DLLs Proton keeps as
+# copies, because installers overwrite them, stay copies too.
+link_builtins() {
+    local pair dir lib file target
+    for pair in $builtin_folders; do
+        dir=$WINEPREFIX/drive_c/windows/${pair%%:*}
+        lib=$engine/lib/wine/${pair#*:}
+        [ -d "$dir" ] || continue
+        while IFS= read -r -d '' file; do
+            target=$lib/${file##*/}
+            [ -f "$target" ] || continue
+            case ${file##*/} in
+                d3dcompiler_*.dll | d3dcsx*.dll | d3dx*.dll | dx8vb.dll | x3daudio*.dll | \
+                    xactengine*.dll | xapofx*.dll | xaudio*.dll | xinput*.dll | atl1*.dll | atl.dll | \
+                    concrt*.dll | msvcp*.dll | msvcr*.dll | vcamp1*.dll | vcomp1*.dll | vccorlib1*.dll | \
+                    vcruntime1*.dll | ucrtbase.dll | comctl32.dll | ntdll.dll | vulkan-1.dll | ir50_32.dll)
+                    continue
+                    ;;
+            esac
+            cmp -s "$file" "$target" && ln -sf "$target" "$file"
+        done < <(find "$dir" -type f -print0)
+    done
+}
+
+# Before Wine updates the prefix, links to an earlier engine (which may be
+# gone) are pointed at this one, as Proton does, since Wine can't start
+# without them. Wine leaves them be: the engine's files are read-only.
+relink_builtins() {
+    local pair dir lib link
+    for pair in $builtin_folders; do
+        dir=$WINEPREFIX/drive_c/windows/${pair%%:*}
+        lib=$engine/lib/wine/${pair#*:}
+        [ -d "$dir" ] || continue
+        while IFS= read -r -d '' link; do
+            if [ -e "$lib/${link##*/}" ]; then
+                ln -sf "$lib/${link##*/}" "$link"
+            else
+                rm "$link"
+            fi
+        done < <(find "$dir" -type l -lname "/*/lib/wine/${pair#*:}/*" -print0)
+    done
+}
+
+# DXMT, DXVK and D3DMetal bring DLLs Wine doesn't have (winemetal.dll and
+# others). Wine only finds a DLL that's also in the prefix, so each gets a
+# link there; which copy loads is still down to the graphics choice above.
+link_graphics_modules() {
+    local folder pair dir file name
+    for folder in "$@"; do
+        for pair in $builtin_folders; do
+            dir=$WINEPREFIX/drive_c/windows/${pair%%:*}
+            [ -d "$folder/${pair#*:}" ] && [ -d "$dir" ] || continue
+            for file in "$folder/${pair#*:}"/*; do
+                name=${file##*/}
+                [ -e "$engine/lib/wine/${pair#*:}/$name" ] && continue
+                if [ -L "$dir/$name" ]; then
+                    [ "$(readlink "$dir/$name")" = "$file" ] || ln -sf "$file" "$dir/$name"
+                elif [ ! -e "$dir/$name" ]; then
+                    ln -s "$file" "$dir/$name"
+                fi
+            done
+        done
+    done
+}
+
+# The user folders Steam Cloud maps Windows saves into, as Proton lays them out.
+# Wine links Documents and the like to the Mac's own folders; each game keeps
+# its own instead, and the Windows XP names point at the modern ones.
+setup_user_folders() {
+    local user="$WINEPREFIX/drive_c/users/steamuser" dir old link
+    for dir in Desktop Documents Downloads Music Pictures Videos; do
+        [ -L "$user/$dir" ] && rm "$user/$dir"
+    done
+    mkdir -p "$user/Documents" "$user/AppData/Local" "$user/AppData/LocalLow" \
+        "$user/AppData/Roaming" "$user/Saved Games" "$user/Local Settings"
+    for old in "My Documents:./Documents" "Application Data:./AppData/Roaming" \
+        "Local Settings/Application Data:../AppData/Local"; do
+        link=${old#*:}
+        old=$user/${old%%:*}
+        if [ -d "$old" ] && [ ! -L "$old" ]; then
+            cp -Rn "$old"/ "$(dirname "$old")/$link"/ 2>/dev/null
+            mv "$old" "$old BACKUP"
+        fi
+        [ "$(readlink "$old")" = "$link" ] || ln -sfn "$link" "$old"
+    done
+}
+
+copy_if_changed() {
+    cmp -s "$1" "$2" || cp -f "$1" "$2"
+}
+
+# Valve's Windows Steam client libraries, which games load and lsteamclient
+# takes over. Mac Steam doesn't have them, so they come from Valve's own
+# Linux client package, checked against Valve's manifest, once.
+steam_windows=$HOME/Library/Caches/Wheelio/steam-windows
+steam_windows_files="steamclient.dll steamclient64.dll GameOverlayRenderer64.dll legacycompat/Steam.dll legacycompat/SteamService.exe legacycompat/iscriptevaluator.exe"
+
+fetch_steam_windows() {
+    local base=https://client-update.akamai.steamstatic.com manifest file sha zip f missing=0
+    for f in $steam_windows_files; do
+        [ -f "$steam_windows/$f" ] || missing=1
+    done
+    [ "$missing" = 1 ] || return 0
+
+    manifest=$(curl -fsSL "$base/steam_client_ubuntu12") || return 1
+    file=$(printf '%s\n' "$manifest" | awk '$1 == "\"bins_misc_ubuntu12\"" { p = 1 } p && $1 == "\"file\"" { gsub(/"/, "", $2); print $2; exit }')
+    sha=$(printf '%s\n' "$manifest" | awk '$1 == "\"bins_misc_ubuntu12\"" { p = 1 } p && $1 == "\"sha2\"" { gsub(/"/, "", $2); print $2; exit }')
+    [ -n "$file" ] && [ -n "$sha" ] || return 1
+
+    mkdir -p "$steam_windows" || return 1
+    zip=$(mktemp "$steam_windows/download.XXXXXX") || return 1
+    if curl -fsSL -o "$zip" "$base/$file" && [ "$(shasum -a 256 "$zip" | cut -d' ' -f1)" = "$sha" ]; then
+        # shellcheck disable=SC2086
+        unzip -qo "$zip" $steam_windows_files -d "$steam_windows"
+    fi
+    rm -f "$zip"
+    for f in $steam_windows_files; do
+        [ -f "$steam_windows/$f" ] || return 1
+    done
+}
+
+# What Proton puts in the prefix's Steam folder.
+setup_steam() {
+    local dir="$WINEPREFIX/drive_c/Program Files (x86)/Steam"
+    if ! fetch_steam_windows; then
+        echo "wheelio: could not download Valve's Windows Steam files; the game may not find Steam" >>"$log"
+        return
+    fi
+    mkdir -p "$dir"
+    copy_if_changed "$steam_windows/steamclient.dll" "$dir/steamclient.dll"
+    copy_if_changed "$steam_windows/steamclient64.dll" "$dir/steamclient64.dll"
+    copy_if_changed "$steam_windows/GameOverlayRenderer64.dll" "$dir/GameOverlayRenderer64.dll"
+    copy_if_changed "$steam_windows/legacycompat/Steam.dll" "$dir/Steam.dll"
+    copy_if_changed "$steam_windows/legacycompat/SteamService.exe" "$dir/steam.exe"
+}
+
+# Prints x64 or x86 for a Windows executable, nothing otherwise.
+pe_machine() {
+    local offset
+    offset=$(od -An -t u4 -j 60 -N 4 "$1" 2>/dev/null | tr -d ' ')
+    [ -n "$offset" ] || return 0
+    case $(od -An -t x2 -j $((offset + 4)) -N 2 "$1" 2>/dev/null | tr -d ' ') in
+        8664) echo x64 ;;
+        014c) echo x86 ;;
+    esac
+}
+
+# Wheelio's DirectInput proxy, next to the game's executable. A dinput8.dll
+# the game shipped itself is left alone.
+install_wheel_proxy() {
+    local exe=$1 dll target
+    [ -n "${WHEELIO_SUPPORT:-}" ] && [ -f "$exe" ] || return 0
+    case $(pe_machine "$exe") in
+        x64) dll=$WHEELIO_SUPPORT/dinput8.dll ;;
+        x86) dll=$WHEELIO_SUPPORT/dinput8_x86.dll ;;
+        *) return 0 ;;
+    esac
+    [ -f "$dll" ] || return 0
+    target=$(dirname "$exe")/dinput8.dll
+    if [ -f "$target" ] && ! grep -qa wheelio_proxy "$target"; then
+        echo "wheelio: $target is the game's own, so force feedback is off" >>"$log"
+        return 0
+    fi
+    copy_if_changed "$dll" "$target"
+}
+
+# Wheelio's OpenXR runtime and its data folder, when the game's arguments ask
+# for OpenXR (-openxr, ETS2's -experimental_vr -openxr, ...). The runtime is
+# named in the registry, as Proton does: OpenXR's loader ignores
+# XR_RUNTIME_JSON in a process it thinks is elevated, which games under Wine
+# can be. A launch without those arguments has the name taken out again, so
+# it sees no runtime.
+openxr_key='HKLM\SOFTWARE\Khronos\OpenXR\1'
+openxr_manifest='C:\ProgramData\Wheelio\OpenXR\wheelio_openxr.json'
+
+# Whether the prefix's registry names a runtime, or ours (system.reg doubles
+# each backslash).
+runtime_named() {
+    grep -q '^"ActiveRuntime"=' <(sed -n '/^\[Software\\\\Khronos\\\\OpenXR\\\\1\]/,/^$/p' "$WINEPREFIX/system.reg")
+}
+runtime_is_ours() {
+    grep -qF '"ActiveRuntime"="C:\\ProgramData\\Wheelio\\OpenXR\\wheelio_openxr.json"' "$WINEPREFIX/system.reg"
+}
+
+setup_vr() {
+    local runtime="$WINEPREFIX/drive_c/ProgramData/Wheelio/OpenXR" data="$WINEPREFIX/drive_c/ProgramData/Wheelio/VR" arg
+    unset XR_RUNTIME_JSON PURR_VR_DATA PURR_VR_LOG PURR_VR_STREAMER
+    for arg in "$@"; do
+        case $(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]') in
+            *openxr*) break ;;
+        esac
+        arg=
+    done
+    if [ -z "$arg" ] || [ -z "${WHEELIO_SUPPORT:-}" ]; then
+        if runtime_named; then
+            "$wine" reg delete "$openxr_key" /v ActiveRuntime /f >>"$log" 2>&1 || true
+        fi
+        return 0
+    fi
+    mkdir -p "$runtime" "$data"
+    copy_if_changed "$WHEELIO_SUPPORT/wheelio_openxr.dll" "$runtime/wheelio_openxr.dll"
+    copy_if_changed "$WHEELIO_SUPPORT/wheelio_openxr.json" "$runtime/wheelio_openxr.json"
+    # Purr's runtime renders at its full eye size unless told otherwise.
+    [ -f "$data/stream.json" ] || echo '{"eye_scale": 1.0}' >"$data/stream.json"
+    if ! runtime_is_ours; then
+        "$wine" reg add "$openxr_key" /v ActiveRuntime /t REG_SZ /d "$openxr_manifest" /f >>"$log" 2>&1
+    fi
+    export XR_RUNTIME_JSON=$openxr_manifest
+    export PURR_VR_DATA=C:/ProgramData/Wheelio/VR/
+    export PURR_VR_LOG=C:/ProgramData/Wheelio/VR/vr.log
+    # Wheelio's Mac app runs the streamer; the runtime mustn't try to.
+    export PURR_VR_STREAMER=external
+}
+
+# --- Verbs -----------------------------------------------------------------
+
+case $verb in
+    getcompatpath)
+        prepare_prefix
+        exec "$wine" winepath -w "$1" 2>>"$log"
+        ;;
+    getnativepath)
+        prepare_prefix
+        exec "$wine" winepath -u "$1" 2>>"$log"
+        ;;
+    runinprefix)
+        prepare_prefix
+        exec "$wine" "$@" >>"$log" 2>&1
+        ;;
+esac
+
+# run and waitforexitandrun: start the game through the steam helper, which
+# sets up what Steam would on Windows, and return its exit code.
+[ "$verb" = waitforexitandrun ] && : >"$log"
+[ -n "${graphics_note:-}" ] && echo "$graphics_note" >>"$log"
+prepare_prefix
+setup_steam
+install_wheel_proxy "${1:-}"
+# The arguments after the executable, so an install folder's name can't count.
+setup_vr "${@:2}"
+
+# Steam runs a game's install script with the evaluator from its own
+# legacycompat folder, which Mac Steam doesn't have.
+case ${1:-} in
+    */legacycompat/iscriptevaluator.exe)
+        [ -f "$1" ] || set -- "$steam_windows/legacycompat/iscriptevaluator.exe" "${@:2}"
+        ;;
+esac
+
+[ "$verb" = waitforexitandrun ] && "$wineserver" -w
+"$wine" 'C:\windows\system32\steam.exe' "$@" >>"$log" 2>&1

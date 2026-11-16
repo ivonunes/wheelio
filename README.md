@@ -1,108 +1,75 @@
 # Wheelio
 
-Wheelio adds force feedback for steering wheels to Windows games you play on a Mac
-through CrossOver or Wine. It can also stream those games to a VR headset.
+Wheelio lets you play Windows driving and sim games from Steam on your Mac, with force feedback
+on your steering wheel and, if you like, in a VR headset.
 
 ## What you need
 
 - A Mac with Apple silicon running macOS 15 or later
-- One of these wheels:
-  - Logitech G923 for PlayStation and PC
-  - Logitech G923 for Xbox and PC
-  - Logitech G29
-  - Logitech G920
+- Steam for Mac
+- A force feedback wheel from Logitech, Thrustmaster, Fanatec or Simagic
 
-The G923 for PlayStation and PC is the one Wheelio is tested with. The others use the same
-force feedback commands and should work, but haven't been tried on real hardware yet.
+<details>
+<summary>Supported wheels</summary>
+
+- Logitech G923, G29, G920, G27, G25, Driving Force GT, Driving Force Pro, Driving Force,
+  MOMO Force, MOMO Racing, G PRO and RS50
+- Thrustmaster T150, TMX, T300RS, T248, TX, TS-XW and TS-PC Racer
+- Fanatec CSL Elite, CSL DD, ClubSport V2 and V2.5, Podium DD1 and DD2, CSR Elite and the
+  Porsche 911 wheel
+- Simagic Alpha, Alpha Mini, Alpha U and EVO
+
+Wheelio is tested with the Logitech G923. The others should work but haven't been tried yet.
+
+</details>
 
 ## Getting started
 
 1. Download Wheelio from the [latest release](../../releases/latest) and open it. It lives in
    the menu bar.
-2. Allow Input Monitoring when macOS asks. Wheelio needs it to talk to the wheel. If you
-   skipped the prompt, the menu bar icon shows a warning with a button that takes you to the
-   right place in System Settings. Choose Relaunch Wheelio afterwards, as the permission only
-   applies once the app restarts.
-3. Choose Set Up a Game… from the menu, pick your CrossOver bottle and the game's `.exe`, and
-   click Install Force Feedback.
-4. Start the game through CrossOver. The setup window tells you when the game has connected.
+2. Allow Input Monitoring when macOS asks, then choose Relaunch Wheelio from its menu.
+3. Choose Settings… and turn on Play Windows games in Steam. If Steam is open, quit it.
+4. Open Steam. Windows games now install and play like Mac ones.
 
-The wheel connects on its own when you plug it in.
-
-## Settings
-
-Choose Settings… from the menu to:
-
-- Start Wheelio when you log in.
-- Adjust the force feedback. Force, Spring and Damper scale what the game sends (100% leaves it
-  as the game intended). Smoothing softens sudden changes. Min. force lifts light road detail
-  above the point where the wheel starts to move.
-- Test the wheel with a short pulse and an LED sweep.
-- Check for updates.
+Some games, such as Euro Truck Simulator 2 and American Truck Simulator, also have a Mac version,
+which Steam installs by default. Wheelio's force feedback and VR need the Windows version, so add
+those games under Force Windows version in Settings. Paste a game's Steam store link there before
+installing it, and Steam only downloads the Windows version.
 
 ## VR
 
-Wheelio can stream games that support VR to a standalone headset over Wi-Fi, using the free
-ALVR app on the headset. ALVR runs on Meta Quest, Pico and other headsets; see
-[ALVR's site](https://github.com/alvr-org/ALVR) for how to install it on yours. Use ALVR
-version 20.14 on the headset, as that's the version Wheelio streams with.
+Wheelio can show games in a Meta Quest, or another headset with Valve's Steam Link app.
 
-1. In Wheelio's settings, turn on Stream games to a VR headset.
-2. Add `-openxr` to the game's Steam launch options. For ETS2 and ATS on the regular branch
-   (1.55 or later), use `-experimental_vr -openxr`.
-3. Start the game, put the headset on and open ALVR. It finds your Mac and connects by itself.
+1. Add `-openxr` to the game's launch options in Steam. For ETS2 and ATS, use
+   `-experimental_vr -openxr`.
+2. Start the game, put the headset on and open Steam Link. Choose your Mac, which has "(VR)"
+   after its name.
+3. The first time, type the PIN the headset shows into the window Wheelio opens.
 
-The game's sound plays in the headset and your Mac is muted while it does. The first time,
-macOS asks whether Wheelio may record system audio, which is how the sound reaches the
-headset. Your Mac and the headset need to be on the same network.
+Your Mac and the headset need to be on the same network. The game's sound plays in the headset.
 
-VR works with 64-bit games that render through OpenXR with DirectX 11 or 12. Head tracking is
-streamed; VR controllers aren't, since you play with the wheel. The VR settings also let you
-choose the video codec, bitrate and whether to mute the Mac. After you change them, the next
-connection drops once and ALVR reconnects a moment later.
+## Good to know
+
+To run Windows games, Wheelio switches on Steam Play, which Mac Steam already contains but keeps
+off. That means signing Steam again on your Mac, so macOS may ask once more for permissions you
+gave Steam. Turning the setting off puts Valve's own copy of Steam back.
+
+When Steam updates to a version Wheelio doesn't support yet, Steam carries on as normal and
+Windows games wait until Wheelio catches up. Settings shows when that's the case.
+
+For DirectX 12 games, add Apple's Game Porting Toolkit in Settings, which walks you through
+downloading it from Apple.
 
 ## Troubleshooting
 
-If the game doesn't pick up force feedback, open `winecfg` for the bottle and check there's a
-DLL override for `dinput8` set to `native, builtin`. Set Up a Game normally adds it for you.
+Each game keeps a log at `steamapps/compatdata/<app id>/wheelio.log` in its Steam library. If a
+game looks wrong or runs slowly, try `WHEELIO_GRAPHICS=dxvk %command%` in its launch options.
 
-For a detailed log, create an empty file called `wheelio_proxy.log` next to the game's
-`dinput8.dll`. Wheelio writes to it while the game runs, and stops once you delete it.
+## Credits
 
-## Setting up a game by hand
-
-The release also includes `dinput8.dll` (64-bit) and `dinput8_x86.dll` (32-bit) for setups the
-installer doesn't cover, such as plain Wine. Copy the one matching the game next to its
-executable, rename it to `dinput8.dll` if needed, add the DLL override above, then start
-Wheelio and the game.
-
-## Development
-
-You need Xcode, Rust and `brew install xcodegen cmake mingw-w64`.
-
-```bash
-./scripts/build-proxy.sh    # Windows DLLs: 64- and 32-bit proxy, OpenXR runtime
-./scripts/gen-xcode.sh      # the Xcode project is generated from project.yml
-xcodebuild -project Wheelio.xcodeproj -scheme Wheelio \
-  -configuration Release -derivedDataPath build build
-```
-
-The app bundles the DLLs and ends up in `build/Build/Products/Release/Wheelio.app`. Local
-builds are ad-hoc signed, so macOS asks for the Input Monitoring and audio permissions again
-after every rebuild; pass `CODE_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)"` to keep
-them. Never build with `CODE_SIGNING_ALLOWED=NO`, or macOS silently refuses audio recording and
-the headset gets no sound.
-
-Tests:
-
-```bash
-cmake -S . -B build-tests && cmake --build build-tests && ctest --test-dir build-tests
-xcodebuild -project Wheelio.xcodeproj -scheme Wheelio -destination 'platform=macOS' test
-(cd streamer && cargo test --release)
-```
-
-The VR streamer is ALVR's server core pinned to v20.14.1 in `streamer/Cargo.toml`. ALVR only
-connects matching versions, so moving the pin means updating the headset version above too.
-The bridge logs to the system log (`log show --predicate 'subsystem == "uk.ivonunes.wheelio"'`)
-and the OpenXR runtime to `wheelio_openxr.log` next to its DLL.
-
+Wheelio runs games on CodeWeavers' Wine from [CrossOver](https://www.codeweavers.com/crossover),
+whose sales fund much of Wine's work on the Mac, with Valve's
+[Proton](https://github.com/ValveSoftware/Proton) connecting games to Steam.
+[NotProton](https://github.com/NotProtonNot/NotProton) showed Steam Play can be switched on in
+Mac Steam. The wheel drivers and VR come from [Purr](https://github.com/NekoLabStudio/purr).
+[DEVELOPMENT.md](DEVELOPMENT.md) lists every component, and how to build Wheelio.

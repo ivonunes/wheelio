@@ -1,13 +1,13 @@
-// Stand-in for a game: drives the Wheelio OpenXR runtime through a full
-// session on D3D11 or D3D12 without an OpenXR loader, so both graphics paths
-// can be checked inside a CrossOver bottle with no game installed.
+// Stand-in for a game: drives the OpenXR runtime (Purr's, built as
+// wheelio_openxr.dll) through a full session on D3D11 or D3D12 without an
+// OpenXR loader, so both graphics paths can be checked inside a CrossOver
+// bottle with no game installed.
 //
 //   wheelio_xr_smoke.exe [--d3d12] [--frames N] [--dll path\to\wheelio_openxr.dll]
 //
 // Each frame clears the left eye to a warm and the right eye to a cool colour
 // that shifts over time, with a white block in the top-left corner so the
-// orientation of what arrives on the mac side is unambiguous. Run with
-// WHEELIO_XR_DUMP=1 to also get the runtime's own PNG dumps.
+// orientation of what arrives on the mac side is unambiguous.
 
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D11
