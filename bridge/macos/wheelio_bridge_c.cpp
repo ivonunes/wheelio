@@ -5,6 +5,7 @@
 
 #include <IOKit/hidsystem/IOHIDLib.h>
 
+#include <cstdio>
 #include <cstring>
 #include <new>
 
@@ -125,6 +126,19 @@ bool wheelio_input_monitoring_request(void) {
     return IOHIDRequestAccess(kIOHIDRequestTypeListenEvent);
 }
 
+void wheelio_vr_set_search_folders(WheelioBridge *bridge, const char *const *folders, size_t count) {
+    if (bridge == nullptr) {
+        return;
+    }
+    std::vector<std::string> list;
+    for (size_t i = 0; folders != nullptr && i < count; ++i) {
+        if (folders[i] != nullptr) {
+            list.emplace_back(folders[i]);
+        }
+    }
+    bridge->vr_reader.set_search_folders(std::move(list));
+}
+
 void wheelio_vr_poll(WheelioBridge *bridge) {
     if (bridge != nullptr) {
         bridge->vr_reader.poll();
@@ -142,4 +156,7 @@ void wheelio_vr_status(WheelioBridge *bridge, WheelioVRStatus *out) {
     const VRFrameReader::Status status = bridge->vr_reader.status();
     out->connected = status.connected;
     out->game_running = status.game_running;
+    std::snprintf(out->frames_path, sizeof(out->frames_path), "%s", status.path.c_str());
+    out->eye_width = status.eye_width;
+    out->eye_height = status.eye_height;
 }

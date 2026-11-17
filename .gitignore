@@ -10,6 +10,7 @@
 /build-windows-x86-release/
 /build-windows-release-x86/
 /build-tests/
+/build-steam/
 /cmake-build-*/
 /dist/
 

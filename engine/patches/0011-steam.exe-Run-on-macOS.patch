@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ivo Nunes <ivo@nunes.uk>
+Date: Mon, 16 Nov 2026 12:36:42 +0000
+Subject: [PATCH] steam.exe: Run on macOS.
+
+Wheelio: Proton's steam helper, adapted for the Mac Steam client:
+
+- steam:// links and commands go to /usr/bin/open, which hands them to
+  the Mac client, rather than Linux Steam's steam-runtime-steam-remote.
+- No CoInitialize, and so no ole32 import: on macOS it gives the helper
+  a Dock icon of its own next to the game's (found by NotProton).
+
+Origin: Wheelio, on Proton's steam_helper (BSD-3-Clause, see the
+copyright notice in steam.c).
+---
+ programs/steam.exe/Makefile.in | 2 +-
+ programs/steam.exe/steam.c     | 7 ++-----
+ 2 files changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/programs/steam.exe/Makefile.in b/programs/steam.exe/Makefile.in
+index 3b57bd1..fdb2338 100644
+--- a/programs/steam.exe/Makefile.in
++++ b/programs/steam.exe/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = steam.exe
+-IMPORTS   = user32 advapi32 shlwapi shell32 msi ole32
++IMPORTS   = user32 advapi32 shlwapi shell32 msi
+ 
+ EXTRADLLFLAGS = -mwindows
+ 
+diff --git a/programs/steam.exe/steam.c b/programs/steam.exe/steam.c
+index b81622d..4802de4 100644
+--- a/programs/steam.exe/steam.c
++++ b/programs/steam.exe/steam.c
+@@ -502,8 +502,6 @@ static HANDLE run_process(BOOL *should_await, BOOL game_process)
+ 
+         dos = wine_get_dos_file_name(scratchA);
+ 
+-        CoInitialize(NULL);
+-
+         console = SHGetFileInfoW(dos, 0, &sfi, sizeof(sfi), SHGFI_EXETYPE);
+         if (console)
+         {
+@@ -659,11 +657,10 @@ static BOOL steam_command_handler(int argc, char *argv[])
+     HMODULE module;
+     const char *sgi;
+     int i, j;
++    /* macOS opens steam:// links in the Mac client. */
+     static char *unix_steam[] =
+     {
+-        (char *)"steam-runtime-steam-remote",
+-        (char *)"steam",
+-        NULL,
++        (char *)"/usr/bin/open",
+     };
+ 
+     /* If there are command line options, only forward steam:// and options start with - */

@@ -6,7 +6,7 @@
 namespace wheelio_bridge {
 
 constexpr std::uint32_t kProtocolMagic = 0x4646424D;  // "FFBM"
-constexpr std::uint16_t kProtocolVersion = 1;
+constexpr std::uint16_t kProtocolVersion = 2;
 constexpr std::uint16_t kDefaultPort = 18423;
 constexpr std::uint32_t kMaxPayloadSize = 4096;
 
@@ -16,7 +16,6 @@ enum class MessageType : std::uint16_t {
     apply_wheel_state = 10,
     stop_all = 11,
     ping = 12,
-    set_led_pattern = 13,
 };
 
 // Wire format is little-endian. Both ends are little-endian today (Apple
@@ -45,35 +44,29 @@ struct HelloAckPayload {
     char wheel_name[64] = {0};
 };
 
+// The game's force feedback, summed over its playing effects, in DirectInput's
+// own units: forces, coefficients and saturations out of 10000, positions on
+// the steering axis from -10000 to 10000. The Mac side turns it into the
+// wheel's forces (force_mapping.hpp).
 struct WheelStatePayload {
-    std::uint8_t autocenter_enabled = 0;
-    std::uint8_t autocenter_force = 0;
-    std::uint8_t autocenter_slope = 0;
+    // A constant push, as the game's constant, ramp and periodic effects add
+    // up; positive turns the wheel left.
+    std::int16_t constant_force = 0;
 
-    std::uint8_t custom_spring_enabled = 0;
-    std::uint8_t spring_deadband_left = 0;
-    std::uint8_t spring_deadband_right = 0;
-    std::uint8_t spring_k1 = 0;
-    std::uint8_t spring_k2 = 0;
-    std::uint8_t spring_sat1 = 0;
-    std::uint8_t spring_sat2 = 0;
-    std::uint8_t spring_clip = 0;
+    // A spring condition (the game's, or DirectInput's autocentre): pushes
+    // towards `spring_offset` once the wheel is more than `spring_deadband`
+    // from it, by the coefficient on that side, up to that side's saturation.
+    std::uint8_t spring_enabled = 0;
+    std::int16_t spring_offset = 0;
+    std::uint16_t spring_deadband = 0;
+    std::int16_t spring_positive_coefficient = 0;
+    std::int16_t spring_negative_coefficient = 0;
+    std::uint16_t spring_positive_saturation = 0;
+    std::uint16_t spring_negative_saturation = 0;
 
-    std::uint8_t damper_enabled = 0;
-    std::uint8_t damper_force_positive = 0;
-    std::uint8_t damper_force_negative = 0;
-    std::uint8_t damper_saturation_positive = 0;
-    std::uint8_t damper_saturation_negative = 0;
-
-    std::uint8_t constant_force_enabled = 0;
-    std::int16_t constant_force_magnitude = 0;
-
-    std::uint8_t led_pattern_enabled = 0;
-    std::uint8_t led_pattern = 0;
-};
-
-struct LedPatternPayload {
-    std::uint8_t pattern = 0;
+    // Damper (and inertia) and friction conditions, by their stronger side.
+    std::uint16_t damper = 0;
+    std::uint16_t friction = 0;
 };
 
 #pragma pack(pop)
@@ -81,8 +74,12 @@ struct LedPatternPayload {
 static_assert(sizeof(MessageHeader) == 12, "Unexpected MessageHeader size");
 static_assert(sizeof(HelloPayload) == 68, "Unexpected HelloPayload size");
 static_assert(sizeof(HelloAckPayload) == 68, "Unexpected HelloAckPayload size");
-static_assert(sizeof(WheelStatePayload) == 21, "Unexpected WheelStatePayload size");
-static_assert(sizeof(LedPatternPayload) == 1, "Unexpected LedPatternPayload size");
+static_assert(sizeof(WheelStatePayload) == 19, "Unexpected WheelStatePayload size");
+
+// Whether a state asks anything of the wheel.
+inline bool has_effects(const WheelStatePayload& state) {
+    return state.constant_force != 0 || state.spring_enabled != 0 || state.damper != 0 || state.friction != 0;
+}
 
 template <typename T>
 constexpr std::size_t payload_size() {

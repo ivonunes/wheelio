@@ -3,7 +3,7 @@ import Foundation
 
 /// Runs the bundled VR streamer while VR is on and a game is rendering in VR,
 /// and stops it when the game exits. Running it only then keeps the Mac's
-/// audio untouched and ALVR quiet the rest of the time. Restarted if it
+/// audio untouched and the headset quiet the rest of the time. Restarted if it
 /// crashes mid-game, and after every headset session by design. Status
 /// arrives as one JSON object per line on its stdout.
 @MainActor
@@ -15,7 +15,7 @@ final class StreamerController: ObservableObject {
         case idle             // no game in VR, streamer not running
         case starting
         case waiting          // running, no headset connected
-        case connected(codec: String, fps: Double)
+        case connected(fps: Double)
         case failed(String)
     }
 
@@ -29,32 +29,51 @@ final class StreamerController: ObservableObject {
     @Published private(set) var stats = Stats()
     @Published private(set) var audioAvailable = false
 
+    /// A Steam Link headset pairing with this Mac (once, for good): it shows a
+    /// PIN, which the player types in here (answerPin).
+    struct Pairing: Equatable {
+        var device: String
+        var pinWasWrong: Bool
+    }
+    @Published private(set) var pairing: Pairing?
+    private var pinWasWrong = false
+
     private var process: Process?
     private var pipe: Pipe?
+    // The streamer stops when its stdin closes, so it is held open while it runs.
+    private var input: Pipe?
     private var lineBuffer = Data()
     private var wantRunning = false
+    // The game in VR it streams.
+    private var game: VRGame?
     private var observers: [AnyCancellable] = []
 
     private init() {}
 
-    /// Run while VR is on and a game is in VR; stop otherwise. Codec, bitrate
-    /// and mute changes restart a running streamer so they apply straight
-    /// away (the headset reconnects within a few seconds).
+    /// Run while a game is in VR; stop otherwise. A new game (a new frames
+    /// file) and bitrate and mute changes restart a running streamer so they
+    /// apply straight away (the headset reconnects within a few seconds).
     func follow(_ bridge: BridgeController, _ settings: VRSettings) {
-        bridge.$vrGameRunning
-            .combineLatest(settings.$enabled)
-            .map { running, enabled in running && enabled }
+        bridge.$vrGame
             .removeDuplicates()
             .sink { [weak self] wanted in
                 guard let self else { return }
-                self.wantRunning = wanted
-                if wanted { self.start() } else { self.stop() }
+                let restarting = self.process != nil && wanted != nil
+                self.game = wanted
+                self.wantRunning = wanted != nil
+                if restarting {
+                    self.restartIfRunning()
+                } else if wanted != nil {
+                    self.start()
+                } else {
+                    self.stop()
+                }
             }
             .store(in: &observers)
 
-        settings.$codec.map { _ in () }
-            .merge(with: settings.$bitrateMbps.map { _ in () }, settings.$muteMac.map { _ in () })
-            .dropFirst(3)
+        settings.$bitrateMbps.map { _ in () }
+            .merge(with: settings.$muteMac.map { _ in () })
+            .dropFirst(2)
             .debounce(for: .seconds(1), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in self?.restartIfRunning() }
             .store(in: &observers)
@@ -74,8 +93,31 @@ final class StreamerController: ObservableObject {
         Bundle.main.url(forResource: "wheelio-streamer", withExtension: nil)
     }
 
+    /// The streamer's arguments for this game: its frames file, the eye size
+    /// it renders, and the runtime's data folder in the game's Wine
+    /// environment (the headset's optics reach the game through it). Controllers stay off: the game is
+    /// played with the wheel.
+    private static func arguments(for game: VRGame) -> [String] {
+        var arguments = ["--frames", game.framesPath,
+                         "--eye", "\(game.eyeWidth)x\(game.eyeHeight)",
+                         "--controllers", "0"]
+        if let data = vrDataDirectory(for: game.framesPath) {
+            arguments += ["--data", data.path]
+        }
+        return arguments + VRSettings.shared.streamerArguments
+    }
+
+    /// The runtime's data folder (PURR_VR_DATA, which the engine's launcher
+    /// sets for every game): ProgramData/Wheelio/VR in the Wine environment
+    /// the frames file is in.
+    static func vrDataDirectory(for framesPath: String) -> URL? {
+        guard let drive = framesPath.range(of: "/drive_c/") else { return nil }
+        return URL(fileURLWithPath: String(framesPath[..<drive.upperBound]) + "ProgramData/Wheelio/VR",
+                   isDirectory: true)
+    }
+
     func start() {
-        guard process == nil else { return }
+        guard process == nil, let game else { return }
         guard let binary = binaryURL else {
             state = .unavailable
             return
@@ -84,8 +126,10 @@ final class StreamerController: ObservableObject {
 
         let process = Process()
         process.executableURL = binary
-        process.arguments = VRSettings.shared.streamerArguments
+        process.arguments = Self.arguments(for: game)
         let pipe = Pipe()
+        let input = Pipe()
+        process.standardInput = input
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
 
@@ -102,6 +146,7 @@ final class StreamerController: ObservableObject {
             try process.run()
             self.process = process
             self.pipe = pipe
+            self.input = input
         } catch {
             state = .failed(error.localizedDescription)
         }
@@ -122,8 +167,12 @@ final class StreamerController: ObservableObject {
         process = nil
         pipe?.fileHandleForReading.readabilityHandler = nil
         pipe = nil
+        try? input?.fileHandleForWriting.close()
+        input = nil
         lineBuffer.removeAll()
         stats = Stats()
+        pairing = nil
+        pinWasWrong = false
     }
 
     private func processExited(_ exited: Process) {
@@ -148,6 +197,14 @@ final class StreamerController: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.start() }
     }
 
+    /// The PIN the headset shows, or nil to cancel pairing.
+    func answerPin(_ pin: String?) {
+        let digits = pin?.filter(\.isNumber) ?? ""
+        let line = digits.isEmpty ? "pin cancel\n" : "pin \(digits)\n"
+        try? input?.fileHandleForWriting.write(contentsOf: Data(line.utf8))
+        if digits.isEmpty { pairing = nil }
+    }
+
     private func consume(_ data: Data) {
         guard !data.isEmpty else { return }  // EOF
         lineBuffer.append(data)
@@ -167,8 +224,7 @@ final class StreamerController: ObservableObject {
             state = .waiting
             stats = Stats()
         case "connected":
-            state = .connected(codec: object["codec"] as? String ?? "",
-                               fps: object["fps"] as? Double ?? 0)
+            state = .connected(fps: object["fps"] as? Double ?? 0)
         case "restarting":
             state = .starting
             stats = Stats()
@@ -176,6 +232,14 @@ final class StreamerController: ObservableObject {
             stats = Stats(fps: object["fps"] as? Double ?? 0,
                           mbps: object["mbps"] as? Double ?? 0,
                           encodeMS: object["encode_ms"] as? Double ?? 0)
+        case "pin_needed":
+            pairing = Pairing(device: object["device"] as? String ?? "", pinWasWrong: pinWasWrong)
+            pinWasWrong = false
+        case "pin_wrong":
+            pinWasWrong = true  // a pin_needed follows
+        case "paired", "pin_cancelled":
+            pairing = nil
+            pinWasWrong = false
         default:
             break
         }

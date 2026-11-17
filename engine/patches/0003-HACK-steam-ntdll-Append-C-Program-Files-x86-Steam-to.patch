@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Eikum <aeikum@codeweavers.com>
+Date: Tue, 13 Jun 2017 12:35:56 -0500
+Subject: [PATCH] HACK: steam: ntdll: Append C:/Program Files (x86)/Steam to
+ PATH.
+
+Wheelio: games that load steamclient.dll or the overlay by bare name find
+the copies the launcher puts in the prefix's Steam folder, as on Proton.
+
+Origin: ValveSoftware/wine adba6db13ee035341983ee2c8e72b2440a2900c1.
+---
+ dlls/ntdll/loader.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index c8fc177..21ad072 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -86,7 +86,7 @@ const WCHAR windows_dir[] = L"C:\\windows";
+ static const WCHAR system_dir[] = L"C:\\windows\\system32\\";
+ 
+ /* system search path */
+-static const WCHAR system_path[] = L"C:\\windows\\system32;C:\\windows\\system;C:\\windows";
++static const WCHAR system_path[] = L"C:\\windows\\system32;C:\\windows\\system;C:\\windows;C:\\Program Files (x86)\\Steam";
+ 
+ static BOOL is_prefix_bootstrap;  /* are we bootstrapping the prefix? */
+ static BOOL wow64_using_32bit_prefix;  /* are we using a 32-bit-only prefix in wow64 mode? */

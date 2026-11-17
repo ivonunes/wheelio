@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: NotProtonNot <notprotonnot@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 11:51:14 +0000
+Subject: [PATCH] lsteamclient: Build for macOS.
+
+Wheelio: Valve's lsteamclient already loads the Mac client's
+steamclient.dylib. These are the remaining changes it needs on a Mac:
+
+- A 64-bit game loads steamclient64.dll, so look for that too when
+  placing allocations near the native steamclient.
+- Don't relocate vtables on 64-bit.
+- The Mac client may not export Steam_IsKnownInterface or
+  Steam_NotifyMissingInterface, so treat them as optional.
+- macOS has no X11 keysyms for Steam Input to map to.
+- NOMINMAX, for std::max with Wine's windef.h.
+- Mac Steam keeps steamclient.dylib in Steam.AppBundle inside its install
+  folder, so look there too (added by Wheelio).
+- Undefine winbase.h's strncpy and wcsncpy macros on the unix side, which
+  break the declarations macOS's libc++ pulls in (added by Wheelio).
+
+Origin: NotProton (https://github.com/NotProtonNot/NotProton) at
+47b903b995198ad62cb23a1e96b240bd7db9fb09, lsteamclient/steamclient_main.c,
+unixlib.cpp and unix_steam_input_manual.cpp, without its overlay shim.
+These files are Valve's and stay under the Steamworks SDK licence
+(dlls/lsteamclient/LICENSE).
+---
+ dlls/lsteamclient/steamclient_main.c          |  9 ++++++--
+ dlls/lsteamclient/unix_private.h              |  5 +++++
+ dlls/lsteamclient/unix_steam_input_manual.cpp |  6 +++++
+ dlls/lsteamclient/unixlib.cpp                 | 22 +++++++++++++++----
+ 4 files changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/lsteamclient/steamclient_main.c b/dlls/lsteamclient/steamclient_main.c
+index 07c4120..65c0d00 100644
+--- a/dlls/lsteamclient/steamclient_main.c
++++ b/dlls/lsteamclient/steamclient_main.c
+@@ -150,14 +150,15 @@ static void *get_mem_from_steamclient_dll(size_t size, unsigned int version, voi
+ 
+     if (!alloc_base)
+     {
++        static const WCHAR steamclient64W[] = {'s','t','e','a','m','c','l','i','e','n','t','6','4','.','d','l','l',0};
+         static const WCHAR steamclientW[] = {'s','t','e','a','m','c','l','i','e','n','t','.','d','l','l',0};
+         const IMAGE_SECTION_HEADER *sec;
+         const IMAGE_NT_HEADERS *nt;
+         HMODULE mod;
+ 
+-        if (!(mod = GetModuleHandleW(steamclientW)))
++        /* A 64 bit game loads steamclient64.dll, a 32 bit one steamclient.dll. */
++        if (!(mod = GetModuleHandleW(steamclient64W)) && !(mod = GetModuleHandleW(steamclientW)))
+         {
+-            /* That is steamclient64.dll for x64 but no known use cases on x64.*/
+             WARN("Module not found, err %lu.\n", GetLastError());
+             alloc_base = error_ptr;
+             return NULL;
+@@ -236,6 +237,9 @@ fallback:
+ 
+ void *alloc_vtable(void *vtable, unsigned int method_count, const char *iface_version)
+ {
++#if defined(__x86_64__) || defined(__aarch64__)
++    return vtable;
++#else
+     static const char *iface_names[] =
+     {
+         "SteamUser",
+@@ -263,6 +267,7 @@ void *alloc_vtable(void *vtable, unsigned int method_count, const char *iface_ve
+ 
+     memcpy(ret, vtable, method_count * sizeof(void *));
+     return ret;
++#endif
+ }
+ 
+ struct steamclient_interface
+diff --git a/dlls/lsteamclient/unix_private.h b/dlls/lsteamclient/unix_private.h
+index 78e128b..8ac0128 100644
+--- a/dlls/lsteamclient/unix_private.h
++++ b/dlls/lsteamclient/unix_private.h
+@@ -7,6 +7,11 @@
+ #include <windef.h>
+ #include <winbase.h>
+ 
++/* winbase.h forbids these with macros, which break the declarations macOS's
++ * libc++ pulls in from <wchar.h>. */
++#undef strncpy
++#undef wcsncpy
++
+ #include "steamclient_structs.h"
+ #include "unixlib.h"
+ 
+diff --git a/dlls/lsteamclient/unix_steam_input_manual.cpp b/dlls/lsteamclient/unix_steam_input_manual.cpp
+index 9064556..97886a4 100644
+--- a/dlls/lsteamclient/unix_steam_input_manual.cpp
++++ b/dlls/lsteamclient/unix_steam_input_manual.cpp
+@@ -192,6 +192,12 @@ uint32_t manual_convert_nNativeKeyCode( uint32_t win_vk )
+         return vk_to_xkeysym[win_vk];
+     return 0;
+ }
++#elif defined(__APPLE__)
++/* No X11 on macOS, so Valve's keysym table has nothing to map onto. */
++uint32_t manual_convert_nNativeKeyCode( uint32_t win_vk )
++{
++    return 0;
++}
+ #else
+ #error You must implement VK<->Native keysym conversion for this platform.
+ #endif
+diff --git a/dlls/lsteamclient/unixlib.cpp b/dlls/lsteamclient/unixlib.cpp
+index 9d63e03..dd03ffd 100644
+--- a/dlls/lsteamclient/unixlib.cpp
++++ b/dlls/lsteamclient/unixlib.cpp
+@@ -1,3 +1,6 @@
++/* Wine's windef.h defines max and min as macros unless NOMINMAX is set, which
++ * breaks the std::max in collapse_path. */
++#define NOMINMAX
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+ #include "unix_private.h"
+@@ -6,6 +9,7 @@
+ #include <pthread.h>
+ #include <stdlib.h>
+ #include <dlfcn.h>
++#include <unistd.h>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -749,7 +753,13 @@ static NTSTATUS steamclient_init( Params *params, bool wow64 )
+ 
+ #ifdef __APPLE__
+     if (getenv( "STEAM_COMPAT_CLIENT_INSTALL_PATH" ))
++    {
+         snprintf( path, PATH_MAX, "%s/steamclient.dylib", getenv( "STEAM_COMPAT_CLIENT_INSTALL_PATH" ) );
++        /* Mac Steam keeps it in its app bundle, inside the install folder. */
++        if (access( path, F_OK ))
++            snprintf( path, PATH_MAX, "%s/Steam.AppBundle/Steam/Contents/MacOS/steamclient.dylib",
++                      getenv( "STEAM_COMPAT_CLIENT_INSTALL_PATH" ) );
++    }
+     else
+     {
+         WARN( "Old Steam client, falling back to DYLD environment to locate native steamclient "
+@@ -795,8 +805,12 @@ static NTSTATUS steamclient_init( Params *params, bool wow64 )
+     LOAD_FUNC( Steam_GetAPICallResult );
+     LOAD_FUNC( Steam_FreeLastCallback );
+     LOAD_FUNC( Steam_ReleaseThreadLocalMemory );
+-    LOAD_FUNC( Steam_IsKnownInterface );
+-    LOAD_FUNC( Steam_NotifyMissingInterface );
++
++#define LOAD_FUNC_OPTIONAL( x )                               \
++    p_##x = (decltype(p_##x))dlsym( steamclient, #x )
++
++    LOAD_FUNC_OPTIONAL( Steam_IsKnownInterface );
++    LOAD_FUNC_OPTIONAL( Steam_NotifyMissingInterface );
+ 
+     TRACE( "Loaded host steamclient from %s\n", debugstr_a(path) );
+     return 0;
+@@ -851,14 +865,14 @@ static NTSTATUS steamclient_Steam_ReleaseThreadLocalMemory( Params *params, bool
+ template< typename Params >
+ static NTSTATUS steamclient_Steam_IsKnownInterface( Params *params, bool wow64 )
+ {
+-    params->_ret = p_Steam_IsKnownInterface( params->version );
++    params->_ret = p_Steam_IsKnownInterface ? p_Steam_IsKnownInterface( params->version ) : true;
+     return 0;
+ }
+ 
+ template< typename Params >
+ static NTSTATUS steamclient_Steam_NotifyMissingInterface( Params *params, bool wow64 )
+ {
+-    p_Steam_NotifyMissingInterface( params->pipe, params->version );
++    if (p_Steam_NotifyMissingInterface) p_Steam_NotifyMissingInterface( params->pipe, params->version );
+     return 0;
+ }
+ 

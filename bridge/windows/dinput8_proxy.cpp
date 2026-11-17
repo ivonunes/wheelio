@@ -1,5 +1,5 @@
 #include "bridge_client.hpp"
-#include "constants.hpp"
+#include "known_wheels.h"
 #include "dinput_effects.hpp"
 #include "wheelio_bridge_protocol.hpp"
 #include <cstdarg>
@@ -81,9 +81,11 @@ inline bool is_game_controller_type(DWORD dev_type) {
            base_type == DIDEVTYPE_JOYSTICK;
 }
 
+// A wheel the Mac side can drive (Purr's known wheels).
 bool is_supported_wheel_vid_pid(DWORD vendor_id, DWORD product_id) {
-    const WheelProfile* profile = find_wheel_profile(vendor_id, product_id);
-    return profile && profile->force_feedback_supported;
+    return vendor_id <= 0xFFFF && product_id <= 0xFFFF &&
+           wheel_registry::known_wheel(static_cast<std::uint16_t>(vendor_id),
+                                       static_cast<std::uint16_t>(product_id)) != nullptr;
 }
 
 bool product_guid_matches_supported_wheel(REFGUID product_guid) {
@@ -1371,9 +1373,7 @@ void send_payload_if_changed(const char* log_prefix,
                              bool& have_last_payload,
                              bool& last_sent_has_state,
                              wheelio_bridge::WheelStatePayload& last_payload) {
-    const bool has_state =
-        payload.autocenter_enabled || payload.custom_spring_enabled ||
-        payload.damper_enabled || payload.constant_force_enabled;
+    const bool has_state = wheelio_bridge::has_effects(payload);
 
     if (has_state) {
         ff_state &= ~DIGFFS_EMPTY;
@@ -1382,12 +1382,12 @@ void send_payload_if_changed(const char* log_prefix,
             !have_last_payload || std::memcmp(&payload, &last_payload, sizeof(payload)) != 0;
         if (payload_changed) {
             append_proxy_logf(
-                "%s spring=%u damper=%u constant=%u constant_mag=%d",
+                "%s constant=%d spring=%u damper=%u friction=%u",
                 log_prefix,
-                static_cast<unsigned>(payload.custom_spring_enabled),
-                static_cast<unsigned>(payload.damper_enabled),
-                static_cast<unsigned>(payload.constant_force_enabled),
-                static_cast<int>(payload.constant_force_magnitude));
+                static_cast<int>(payload.constant_force),
+                static_cast<unsigned>(payload.spring_enabled),
+                static_cast<unsigned>(payload.damper),
+                static_cast<unsigned>(payload.friction));
             bridge_send_state(payload);
             last_payload = payload;
             have_last_payload = true;

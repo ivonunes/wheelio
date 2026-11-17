@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ivo Nunes <ivo@nunes.uk>
+Date: Mon, 16 Nov 2026 12:43:26 +0000
+Subject: [PATCH] shell32: Name the user's profile folder after the user when
+ asked.
+
+Wheelio: CrossOver calls every user "crossover" (Hack 12735), and
+CX_REPORT_REAL_USERNAME turns that off for GetUserNameW but not for the
+profile folder, which stays C:\users\crossover. Games run as "steamuser",
+as on Proton, because that is the folder Steam Cloud maps Windows saves
+into, so the profile folder follows GetUserNameW.
+
+Origin: Wheelio.
+---
+ dlls/shell32/shellpath.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/shell32/shellpath.c b/dlls/shell32/shellpath.c
+index adfa296..720413c 100644
+--- a/dlls/shell32/shellpath.c
++++ b/dlls/shell32/shellpath.c
+@@ -2632,9 +2632,12 @@ static HRESULT _SHExpandEnvironmentStrings(LPCWSTR szSrc, LPWSTR szDest)
+         }
+         else if (!wcsnicmp(szTemp, L"%USERPROFILE%", lstrlenW(L"%USERPROFILE%")))
+         {
+-            /* CrossOver Hack 12735 */
+-            static const WCHAR userName[] = {'c','r','o','s','s','o','v','e','r',0};
++            /* CrossOver Hack 12735, which GetUserNameW keeps unless
++             * CX_REPORT_REAL_USERNAME is set */
++            WCHAR userName[257] = L"crossover";
++            DWORD userNameLen = ARRAY_SIZE(userName);
+ 
++            GetUserNameW(userName, &userNameLen);
+             lstrcpyW(szDest, szProfilesPrefix);
+             PathAppendW(szDest, userName);
+             PathAppendW(szDest, szTemp + lstrlenW(L"%USERPROFILE%"));

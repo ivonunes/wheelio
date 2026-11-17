@@ -1,0 +1,79 @@
+name: Update Purr
+
+# Weekly check for a newer Purr release. When Purr's latest release isn't the
+# commit `purr/` is pinned to, the pin moves to that release's tag and the
+# change goes to a pull request on the fixed `purr-update` branch, where the
+# normal CI builds and tests it. Only releases, never Purr's main. The PR is
+# edited in place on later runs and closed once main has the release. See
+# scripts/open-update-pr.sh for how the PR's checks are started.
+#
+# The branch is pushed with the deploy key in the `updates` environment, which
+# only main may use and which needs no approval.
+
+on:
+  schedule:
+    - cron: "47 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-purr
+  cancel-in-progress: false
+
+env:
+  PURR: NekoLabStudio/purr
+
+jobs:
+  update:
+    name: Check Purr
+    runs-on: ubuntu-latest
+    environment: updates
+    steps:
+      # Purr itself isn't checked out: only the pin changes.
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+          ssh-key: ${{ secrets.UPDATES_DEPLOY_KEY }}
+
+      - name: Compare the pin with Purr's latest release
+        id: update
+        run: |
+          tag="$(gh release view --repo "$PURR" --json tagName --jq .tagName 2>/dev/null || true)"
+          if [ -z "$tag" ]; then
+            echo "result=current" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          remote="https://github.com/$PURR.git"
+          commit="$(git ls-remote "$remote" "refs/tags/$tag^{}" | cut -f1)"
+          [ -n "$commit" ] || commit="$(git ls-remote "$remote" "refs/tags/$tag" | cut -f1)"
+          [ -n "$commit" ] || { echo "Purr's release $tag has no tag to pin" >&2; exit 1; }
+          if [ "$commit" = "$(git rev-parse HEAD:purr)" ]; then
+            echo "result=current" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git update-index --cacheinfo 160000,"$commit",purr
+          printf 'Moves %s to Purr [%s](https://github.com/%s/releases/tag/%s).\n' "\`purr/\`" "$tag" "$PURR" "$tag" \
+            >"$RUNNER_TEMP/pr-body.md"
+          echo "result=updated" >>"$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Close a stale PR
+        if: steps.update.outputs.result == 'current'
+        run: |
+          pr="$(gh pr list --head purr-update --state open --json number --jq '.[0].number' || true)"
+          if [ -n "$pr" ]; then
+            gh pr close "$pr" --comment "main already has Purr's latest release." --delete-branch
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Open or update the PR
+        if: steps.update.outputs.result == 'updated'
+        run: scripts/open-update-pr.sh purr-update "Update Purr" "$RUNNER_TEMP/pr-body.md"
+        env:
+          GH_TOKEN: ${{ github.token }}

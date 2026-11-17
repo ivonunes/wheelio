@@ -2,7 +2,7 @@
 # Build a Wheelio release into dist/wheelio-<version>.zip.
 #
 #   scripts/release.sh          build, then sign and package (local use)
-#   scripts/release.sh build    build and stage the unsigned app and DLLs
+#   scripts/release.sh build    build and stage the unsigned app
 #   scripts/release.sh sign     sign and notarize the staged app, then zip it
 #
 # CI runs the two halves in separate jobs, so the signing secrets never share a
@@ -41,7 +41,7 @@ build() {
   local mac_app="${mac_build_dir}/Build/Products/Release/Wheelio.app"
 
   # 1. Build the Windows DLLs first, so the app's build phase bundles these
-  #    exact copies and they're also available as standalone files.
+  #    exact copies.
   cmake -S "${repo_root}" -B "${windows_build_dir}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_WINDOWS_PROXY=ON \
@@ -71,16 +71,11 @@ build() {
     MARKETING_VERSION="${version}" \
     build
 
-  # 3. Stage the app and the standalone DLLs. The app already bundles the DLLs
-  #    via its build phase; nothing is copied into it here, which would
-  #    invalidate its signature.
+  # 3. Stage the app. It already bundles the DLLs via its build phase; nothing
+  #    is copied into it here, which would invalidate its signature.
   rm -rf "${stage_dir}" "${zip_path}"
   mkdir -p "${stage_dir}"
   ditto "${mac_app}" "${staged_app}"
-  cp "${windows_build_dir}/dinput8.dll" "${stage_dir}/dinput8.dll"
-  cp "${windows_build_dir}-x86/dinput8.dll" "${stage_dir}/dinput8_x86.dll"
-  cp "${windows_build_dir}/wheelio_openxr.dll" "${stage_dir}/wheelio_openxr.dll"
-  cp "${repo_root}/bridge/windows/openxr/wheelio_openxr.json" "${stage_dir}/wheelio_openxr.json"
   echo "Staged ${stage_dir}"
 }
 
@@ -98,6 +93,8 @@ sign() {
     codesign --force --options runtime --timestamp \
       --entitlements "${entitlements}" \
       --sign "${CODESIGN_IDENTITY}" "${staged_app}/Contents/Resources/wheelio-streamer"
+    codesign --force --timestamp \
+      --sign "${CODESIGN_IDENTITY}" "${staged_app}/Contents/Resources/libwheelio_steam.dylib"
     codesign --force --options runtime --timestamp \
       --entitlements "${entitlements}" \
       --sign "${CODESIGN_IDENTITY}" "${staged_app}"

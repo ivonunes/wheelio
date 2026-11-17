@@ -82,8 +82,9 @@ final class BridgeController: ObservableObject {
     @Published private(set) var smoothing: Double = 0.0  // off by default
     @Published private(set) var minForce: Double = 0.0   // off by default
     @Published private(set) var isSelfTesting = false
-    /// A game is rendering through the VR runtime right now.
-    @Published private(set) var vrGameRunning = false
+    /// The game rendering through the VR runtime right now, if any.
+    @Published private(set) var vrGame: VRGame?
+    var vrGameRunning: Bool { vrGame != nil }
 
     private let handle: OpaquePointer
     private let idleSleepGuard = IdleSleepGuard()
@@ -145,10 +146,13 @@ final class BridgeController: ObservableObject {
 
         // Also keep an eye on the VR runtime: the streamer runs only while a
         // game is in VR, so the Mac's audio is only captured then.
+        let compatData = Steam.libraryFolders().map { $0.appendingPathComponent("steamapps/compatdata").path }
+        withCStrings(compatData) { wheelio_vr_set_search_folders(handle, $0, compatData.count) }
         wheelio_vr_poll(handle)
         var vr = WheelioVRStatus()
         wheelio_vr_status(handle, &vr)
-        if vr.game_running != vrGameRunning { vrGameRunning = vr.game_running }
+        let game = vr.game_running ? VRGame(vr) : nil
+        if game != vrGame { vrGame = game }
 
         idleSleepGuard.active = status.clientConnected || vrGameRunning
     }
@@ -250,4 +254,28 @@ final class BridgeController: ObservableObject {
         idleSleepGuard.active = false
         wheelio_bridge_stop(handle)
     }
+}
+
+/// A game in VR: the file its OpenXR runtime publishes frames in, inside the
+/// game's Wine environment, and the size of each eye in it.
+struct VRGame: Equatable {
+    let framesPath: String
+    let eyeWidth: UInt32
+    let eyeHeight: UInt32
+
+    init(_ status: WheelioVRStatus) {
+        framesPath = withUnsafeBytes(of: status.frames_path) { bytes in
+            String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        eyeWidth = status.eye_width
+        eyeHeight = status.eye_height
+    }
+}
+
+/// Runs `body` with the strings as an array of C strings.
+private func withCStrings<Result>(_ strings: [String],
+                                  _ body: (UnsafePointer<UnsafePointer<CChar>?>?) -> Result) -> Result {
+    var pointers = strings.map { UnsafePointer(strdup($0)) }
+    defer { pointers.forEach { free(UnsafeMutablePointer(mutating: $0)) } }
+    return pointers.withUnsafeMutableBufferPointer { body(UnsafePointer($0.baseAddress)) }
 }

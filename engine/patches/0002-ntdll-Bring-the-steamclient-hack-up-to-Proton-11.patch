@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Gofman <pgofman@codeweavers.com>
+Date: Mon, 7 Jul 2025 10:22:16 +0300
+Subject: [PATCH] ntdll: Bring the steamclient hack up to Proton 11.
+
+Wheelio: Proton's later fixes to the hack in 0001, which the lsteamclient
+we build (Proton 11) expects:
+
+- PROTON_DISABLE_LSTEAMCLIENT=1 turns the redirection off, for diagnosis.
+- The 32-bit steamclient.dll gets its on-disk ImageBase back, which its
+  callers read.
+- The 64-bit steamclient64.dll and gameoverlayrenderer64.dll have their
+  tier0_s64 and vstdlib_s64 imports pointed at ntdll, so those Windows
+  Steam libraries are not needed, and their other imports are fully
+  resolved without running their DllMain.
+
+Origin: ValveSoftware/wine, squashed from
+  1788b2350212 ntdll: Add PROTON_DISABLE_LSTEAMCLIENT config option. (Paul Gofman)
+  0ec337a47535 HACK: ntdll: Fixup OptionalHeader.ImageBase back in steamclient.dll. (Paul Gofman)
+  bb6514f45fd2 ntdll: HACK: Partially fixup imports for Win Steam libs. (Paul Gofman)
+  b1cce9c4204d ntdll: Fully resolve 64bit native steamclient dependencies without calling DllMain(). (Arkadiusz Hiler)
+Adapted to CrossOver 26.3, whose build_module still tests
+DONT_RESOLVE_DLL_REFERENCES rather than LDR_DONT_RESOLVE_REFS.
+---
+ dlls/ntdll/loader.c | 64 ++++++++++++++++++++++++++++++++++++++++++---
+ include/winternl.h  |  1 +
+ 2 files changed, 61 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index 0804ceb..c8fc177 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -1149,6 +1149,19 @@ void * WINAPI RtlFindExportedRoutineByName( HMODULE module, const char *name )
+ }
+ 
+ 
++static int use_lsteamclient(void)
++{
++    WCHAR env[32];
++    static int use = -1;
++
++    if (use != -1) return use;
++
++    use = !get_env( L"PROTON_DISABLE_LSTEAMCLIENT", env, sizeof(env) ) || *env == '0';
++    if (!use)
++        ERR("lsteamclient disabled.\n");
++    return use;
++}
++
+ /*************************************************************************
+  *		import_dll
+  *
+@@ -1186,6 +1199,18 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
+         return TRUE;
+     }
+ 
++    if (use_lsteamclient())
++    {
++        if ((!strcmp(name, "tier0_s64.dll") || !strcmp(name, "vstdlib_s64.dll")) && wm->ldr.BaseDllName.Buffer
++            && (!wcscmp(wm->ldr.BaseDllName.Buffer, L"steamclient64.dll")
++                || !wcscmp(wm->ldr.BaseDllName.Buffer, L"gameoverlayrenderer64.dll")))
++        {
++            TRACE("%s -> ntdll.\n", name);
++            name = "ntdll.dll";
++            len = strlen(name);
++        }
++    }
++
+     status = build_import_name( wm, buffer, name, len );
+     if (!status) status = load_dll( load_path, buffer, 0, &wmImp, system );
+ 
+@@ -1710,7 +1735,7 @@ static NTSTATUS MODULE_InitDLL( WINE_MODREF *wm, UINT reason, LPVOID lpReserved
+ 
+     /* Skip calls for modules loaded with special load flags */
+ 
+-    if (wm->ldr.Flags & LDR_DONT_RESOLVE_REFS) return STATUS_SUCCESS;
++    if (wm->ldr.Flags & (LDR_DONT_RESOLVE_REFS | LDR_DONT_CALL_DLLMAIN)) return STATUS_SUCCESS;
+     if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, reason );
+     if (!entry) return STATUS_SUCCESS;
+ 
+@@ -2293,6 +2318,7 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name,
+     SIZE_T map_size;
+     WCHAR *basename, *tmp;
+     ULONG basename_len;
++    BOOL is_steamclient32;
+ 
+     if (!(nt = RtlImageNtHeader( *module ))) return STATUS_INVALID_IMAGE_FORMAT;
+ 
+@@ -2320,7 +2346,7 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name,
+     basename_len = wcslen(basename);
+     if (basename_len >= 4 && !wcscmp(basename + basename_len - 4, L".dll")) basename_len -= 4;
+ 
+-    if ((!RtlCompareUnicodeStrings(basename, basename_len, L"steamclient", 11, TRUE) ||
++    if (use_lsteamclient() && ((is_steamclient32 = !RtlCompareUnicodeStrings(basename, basename_len, L"steamclient", 11, TRUE)) ||
+          !RtlCompareUnicodeStrings(basename, basename_len, L"steamclient64", 13, TRUE) ||
+          !RtlCompareUnicodeStrings(basename, basename_len, L"gameoverlayrenderer", 19, TRUE) ||
+          !RtlCompareUnicodeStrings(basename, basename_len, L"gameoverlayrenderer64", 21, TRUE)) &&
+@@ -2329,9 +2355,39 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name,
+     {
+         struct steamclient_setup_trampolines_params params = {.src_mod = *module, .tgt_mod = lsteamclient};
+         WINE_UNIX_CALL( unix_steamclient_setup_trampolines, &params );
+-        wm->ldr.Flags |= LDR_DONT_RESOLVE_REFS;
+-        flags |= DONT_RESOLVE_DLL_REFERENCES;
+         NtFlushInstructionCache( NtCurrentProcess(), *module, map_size );
++        if (is_steamclient32)
++        {
++            OBJECT_ATTRIBUTES attr;
++            void *addr = *module;
++            SIZE_T size = 0x1000;
++            LARGE_INTEGER offset;
++            IO_STATUS_BLOCK io;
++            DWORD protect_old;
++            HANDLE file;
++
++            wm->ldr.Flags |= LDR_DONT_RESOLVE_REFS;
++            flags |= DONT_RESOLVE_DLL_REFERENCES;
++
++            NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, PAGE_READWRITE, &protect_old );
++            memset( &attr, 0, sizeof(attr) );
++            attr.Length = sizeof(attr);
++            attr.Attributes = OBJ_CASE_INSENSITIVE;
++            attr.ObjectName = (UNICODE_STRING *)nt_name;
++            NtOpenFile( &file, GENERIC_READ | SYNCHRONIZE, &attr, &io,
++                        FILE_SHARE_READ | FILE_SHARE_DELETE,
++                        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE );
++            offset.QuadPart = (ULONG_PTR)&nt->OptionalHeader.ImageBase - (ULONG_PTR)addr;
++            NtReadFile( file, 0, NULL, NULL, &io, &nt->OptionalHeader.ImageBase,
++                        sizeof(nt->OptionalHeader.ImageBase), &offset, NULL );
++            NtClose( file );
++            TRACE( "steamclient ImageBase %#Ix.\n", nt->OptionalHeader.ImageBase );
++            NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, protect_old, &protect_old );
++        }
++        else
++        {
++            wm->ldr.Flags |= LDR_DONT_CALL_DLLMAIN;
++        }
+     }
+ 
+     /* fixup imports */
+diff --git a/include/winternl.h b/include/winternl.h
+index 80c295f..54ededf 100644
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -4005,6 +4005,7 @@ typedef void (CALLBACK *PLDR_DLL_NOTIFICATION_FUNCTION)(ULONG, LDR_DLL_NOTIFICAT
+ /* these ones is Wine specific */
+ #define LDR_DONT_RESOLVE_REFS           0x40000000
+ #define LDR_WINE_INTERNAL               0x80000000
++#define LDR_DONT_CALL_DLLMAIN           0x20000000
+ 
+ /* flag for LdrAddRefDll */
+ #define LDR_ADDREF_DLL_PIN              0x00000001

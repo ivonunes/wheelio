@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ivo Nunes <ivo@nunes.uk>
+Date: Mon, 16 Nov 2026 11:50:00 +0000
+Subject: [PATCH] ntdll: Search WINEDLLPATH_PREPEND before Wine's own modules.
+
+Wheelio: lets the launcher choose the graphics backend per game. DXMT
+and Apple's D3DMetal ship builtin-style d3d11.dll, dxgi.dll and friends
+with their own unix libraries, and they have to win over Wine's wined3d
+versions of the same names. WINEDLLPATH is searched after Wine's own
+folder, so it can't do that. CrossOver does the same through its closed
+cxcompatdb.so (CW Hack 24067), which isn't in the source release.
+
+Origin: Wheelio.
+---
+ dlls/ntdll/unix/loader.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index d0d1007..a6f3546 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -386,14 +386,22 @@ void prepend_dll_path(const char *path)
+ 
+ static void set_dll_path(void)
+ {
+-    char *p, *path = getenv( "WINEDLLPATH" );
++    char *p, *path = getenv( "WINEDLLPATH" ), *prepend = getenv( "WINEDLLPATH_PREPEND" );
+     int i, count = 0;
+ 
+     if (path) for (p = path, count = 1; *p; p++) if (*p == ':') count++;
++    if (prepend) for (p = prepend, count++; *p; p++) if (*p == ':') count++;
+ 
+     dll_paths = malloc( (count + 2) * sizeof(*dll_paths) );
+     count = 0;
+ 
++    if (prepend)
++    {
++        prepend = strdup(prepend);
++        for (p = strtok( prepend, ":" ); p; p = strtok( NULL, ":" )) dll_paths[count++] = strdup( p );
++        free( prepend );
++    }
++
+     if (!build_dir) dll_paths[count++] = dll_dir;
+ 
+     if (path)

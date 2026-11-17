@@ -35,8 +35,7 @@ void test_sizes() {
     expect_eq(sizeof(MessageHeader), std::size_t{12}, "MessageHeader size");
     expect_eq(sizeof(HelloPayload), std::size_t{68}, "HelloPayload size");
     expect_eq(sizeof(HelloAckPayload), std::size_t{68}, "HelloAckPayload size");
-    expect_eq(sizeof(WheelStatePayload), std::size_t{21}, "WheelStatePayload size");
-    expect_eq(sizeof(LedPatternPayload), std::size_t{1}, "LedPatternPayload size");
+    expect_eq(sizeof(WheelStatePayload), std::size_t{19}, "WheelStatePayload size");
 }
 
 void test_header_byte_layout() {
@@ -59,42 +58,61 @@ void test_header_byte_layout() {
     // type (u16 LE) at offset 6 == 10 (apply_wheel_state).
     expect_eq(bytes[6], std::uint8_t{10}, "type low byte");
     expect_eq(bytes[7], std::uint8_t{0}, "type high byte");
-    // payload_size (u32 LE) at offset 8 == 21.
-    expect_eq(bytes[8], std::uint8_t{21}, "payload_size byte 0");
+    // payload_size (u32 LE) at offset 8 == 19.
+    expect_eq(bytes[8], std::uint8_t{19}, "payload_size byte 0");
     expect_eq(bytes[9], std::uint8_t{0}, "payload_size byte 1");
+}
+
+void expect_le16(const std::uint8_t* bytes, std::size_t offset, std::uint16_t value, const std::string& name) {
+    expect_eq(bytes[offset], static_cast<std::uint8_t>(value & 0xFF), name + " low byte at offset " + std::to_string(offset));
+    expect_eq(bytes[offset + 1], static_cast<std::uint8_t>(value >> 8), name + " high byte");
 }
 
 void test_wheel_state_offsets_and_roundtrip() {
     using namespace wheelio_bridge;
     WheelStatePayload payload{};
-    payload.autocenter_enabled = 1;
-    payload.autocenter_force = 2;
-    payload.autocenter_slope = 3;
-    payload.custom_spring_enabled = 1;
-    payload.spring_clip = 99;
-    payload.damper_enabled = 1;
-    payload.constant_force_enabled = 1;
-    payload.constant_force_magnitude = -1234;  // signed 16-bit
-    payload.led_pattern_enabled = 1;
-    payload.led_pattern = 0x1F;
+    payload.constant_force = -1234;
+    payload.spring_enabled = 1;
+    payload.spring_offset = -500;
+    payload.spring_deadband = 300;
+    payload.spring_positive_coefficient = 7000;
+    payload.spring_negative_coefficient = -6000;
+    payload.spring_positive_saturation = 10000;
+    payload.spring_negative_saturation = 9000;
+    payload.damper = 4000;
+    payload.friction = 2500;
 
     std::uint8_t bytes[sizeof(WheelStatePayload)];
     std::memcpy(bytes, &payload, sizeof(bytes));
 
-    // Spot-check a few fixed offsets so reordering fields is caught.
-    expect_eq(bytes[0], std::uint8_t{1}, "autocenter_enabled at offset 0");
-    expect_eq(bytes[1], std::uint8_t{2}, "autocenter_force at offset 1");
-    // constant_force_magnitude is a little-endian int16 at offset 17.
-    const std::uint16_t raw = static_cast<std::uint16_t>(static_cast<std::int16_t>(-1234));
-    expect_eq(bytes[17], static_cast<std::uint8_t>(raw & 0xFF), "constant_force_magnitude low byte at offset 17");
-    expect_eq(bytes[18], static_cast<std::uint8_t>((raw >> 8) & 0xFF), "constant_force_magnitude high byte at offset 18");
-    expect_eq(bytes[19], std::uint8_t{1}, "led_pattern_enabled at offset 19");
-    expect_eq(bytes[20], std::uint8_t{0x1F}, "led_pattern at offset 20");
+    // Every field at its fixed offset, little-endian, so reordering or
+    // retyping one is caught.
+    expect_le16(bytes, 0, static_cast<std::uint16_t>(std::int16_t{-1234}), "constant_force");
+    expect_eq(bytes[2], std::uint8_t{1}, "spring_enabled at offset 2");
+    expect_le16(bytes, 3, static_cast<std::uint16_t>(std::int16_t{-500}), "spring_offset");
+    expect_le16(bytes, 5, 300, "spring_deadband");
+    expect_le16(bytes, 7, 7000, "spring_positive_coefficient");
+    expect_le16(bytes, 9, static_cast<std::uint16_t>(std::int16_t{-6000}), "spring_negative_coefficient");
+    expect_le16(bytes, 11, 10000, "spring_positive_saturation");
+    expect_le16(bytes, 13, 9000, "spring_negative_saturation");
+    expect_le16(bytes, 15, 4000, "damper");
+    expect_le16(bytes, 17, 2500, "friction");
 
     // Round-trip the raw bytes back into a struct and compare every field.
     WheelStatePayload decoded{};
     std::memcpy(&decoded, bytes, sizeof(decoded));
     expect(std::memcmp(&payload, &decoded, sizeof(payload)) == 0, "wheel state round-trips byte-for-byte");
+}
+
+void test_has_effects() {
+    using namespace wheelio_bridge;
+    WheelStatePayload state{};
+    expect(!has_effects(state), "an empty state asks nothing of the wheel");
+    state.friction = 1;
+    expect(has_effects(state), "friction alone is an effect");
+    state = {};
+    state.spring_enabled = 1;
+    expect(has_effects(state), "a spring is an effect");
 }
 
 }  // namespace
@@ -109,8 +127,8 @@ void test_desired_state_is_redelivered_until_it_lands() {
     expect(!desired.needs_delivery(), "redelivering with no state does nothing");
 
     WheelStatePayload spring{};
-    spring.custom_spring_enabled = 1;
-    spring.spring_k1 = 5;
+    spring.spring_enabled = 1;
+    spring.spring_positive_coefficient = 5;
     desired.set(spring);
     expect(desired.needs_delivery(), "a new state needs delivering");
     // The delivery failed: it stays pending.
@@ -121,7 +139,7 @@ void test_desired_state_is_redelivered_until_it_lands() {
     // The receiver lost it (reconnect, wheel reopened): the same state again.
     desired.redeliver();
     expect(desired.needs_delivery(), "a lost state is delivered again");
-    expect_eq(desired.state().spring_k1, std::uint8_t{5}, "the redelivered state is the last one set");
+    expect_eq(desired.state().spring_positive_coefficient, std::int16_t{5}, "the redelivered state is the last one set");
 
     desired.clear();
     expect(!desired.needs_delivery() && !desired.has_state(), "a stop leaves nothing to deliver");
@@ -133,6 +151,7 @@ int main() {
     test_sizes();
     test_header_byte_layout();
     test_wheel_state_offsets_and_roundtrip();
+    test_has_effects();
     test_desired_state_is_redelivered_until_it_lands();
 
     if (g_failures != 0) {

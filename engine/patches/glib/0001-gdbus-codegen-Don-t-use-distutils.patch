@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ivo Nunes <ivo@nunes.uk>
+Date: Mon, 16 Nov 2026 14:04:55 +0000
+Subject: [PATCH] gdbus-codegen: Don't use distutils.
+
+Wheelio: distutils is gone from Python 3.12, which Homebrew's meson runs
+on, and GLib 2.78's gdbus-codegen only used it to order version numbers.
+
+Origin: Wheelio, after GLib's own later removal of distutils.
+---
+ gio/gdbus-2.0/codegen/utils.py | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/gio/gdbus-2.0/codegen/utils.py b/gio/gdbus-2.0/codegen/utils.py
+index 0204610..4087ee2 100644
+--- a/gio/gdbus-2.0/codegen/utils.py
++++ b/gio/gdbus-2.0/codegen/utils.py
+@@ -19,7 +19,6 @@
+ #
+ # Author: David Zeuthen <davidz@redhat.com>
+ 
+-import distutils.version
+ import os
+ import sys
+ 
+@@ -166,4 +165,4 @@ def version_cmp_key(key):
+         v = str(key[0])
+     else:
+         v = "0"
+-    return (distutils.version.LooseVersion(v), key[1])
++    return (tuple(int(p) if p.isdigit() else 0 for p in v.split(".")), key[1])

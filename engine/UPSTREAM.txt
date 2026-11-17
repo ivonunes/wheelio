@@ -1,0 +1,55 @@
+# Everything engine/build.sh downloads, pinned. One input per line:
+#   name  digest  url
+# The digest is the file's SHA-256, or the commit for a git repository.
+
+# CodeWeavers' Wine and most of the libraries the engine bundles (FreeType,
+# GnuTLS, GMP) come from CrossOver's source release. Moving to a new release
+# means a new line here and patches that still apply.
+crossover-sources  ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872  https://media.codeweavers.com/pub/crossover/source/crossover-sources-26.3.0.tar.gz
+
+# The release's copy of Nettle is missing its Makefile.in, so it comes from
+# GNU instead, at the version CrossOver 26.3 uses.
+nettle  b4c518adb174e484cb4acea54118f02380c7133771e7e9beb98a0787194ee47c  https://ftp.gnu.org/gnu/nettle/nettle-3.10.tar.gz
+
+# lsteamclient (Valve, Steamworks SDK licence) and the steam helper
+# (BSD-3-Clause), from Proton 11.
+proton  164e0ccd2ea2b1ec2e5d08dc97f65b184c2539ca  https://github.com/ValveSoftware/Proton.git
+
+# Direct3D 10 and 11 on Metal (MIT).
+dxmt  8f260e36b5739e68f3bad613381441385c4dc7b85b78ba8de653d5a6a264529d  https://github.com/3Shain/dxmt/releases/download/v0.80/dxmt-v0.80-builtin.tar.gz
+dxmt-license  6b928413c6308c106f3e0080bd94b6427b56d587d400fd40e6cbfbab7d9c4ae1  https://raw.githubusercontent.com/3Shain/dxmt/v0.80/LICENSE
+
+# Game controllers reach Wine through SDL (zlib licence).
+sdl2  5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165  https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-2.32.10.tar.gz
+
+# Wine Mono and Wine Gecko, the versions CrossOver 26.3's Wine asks for
+# (dlls/appwiz.cpl/addons.c), unpacked where Wine finds them without asking.
+wine-mono  a16606ef0724202e6a6848ece6e0cbba64d11e2f11aefe744af1d93c6d9f99bb  https://dl.winehq.org/wine/wine-mono/10.4.1/wine-mono-10.4.1-x86.tar.xz
+wine-mono-license  0265443ffc97c9450dbcf402c2430bf9fe87d7a6c92d5d7684fcecfe749bf75d  https://gitlab.winehq.org/mono/wine-mono/-/raw/wine-mono-10.4.1/COPYING
+wine-gecko-x86  2cfc8d5c948602e21eff8a78613e1826f2d033df9672cace87fed56e8310afb6  https://dl.winehq.org/wine/wine-gecko/2.47.4/wine-gecko-2.47.4-x86.tar.xz
+wine-gecko-x86_64  fd88fc7e537d058d7a8abf0c1ebc90c574892a466de86706a26d254710a82814  https://dl.winehq.org/wine/wine-gecko/2.47.4/wine-gecko-2.47.4-x86_64.tar.xz
+wine-gecko-license  a799adf18bfb1911f16086dc0e2a6d1cd0e31272f47e7ee6841b465b74d249de  https://gitlab.winehq.org/wine/wine-gecko/-/raw/wine-gecko-2.47.4/LICENSE
+wine-gecko-licenses  18412e6665fd12c854c85aef601a564bda44363845828b158e7e93e0c2d8f177  https://gitlab.winehq.org/wine/wine-gecko/-/raw/wine-gecko-2.47.4/toolkit/content/license.html
+
+# What CrossOver's MoltenVK builds against, at the commits its
+# ExternalRevisions (and glslang's known_good.json) name. build.sh checks they
+# still agree.
+cereal  51cbda5f30e56c801c07fe3d3aba5d7fb9e6cca4  https://github.com/USCiLab/cereal.git
+vulkan-headers  fc6c06ac529e4b4b6e34c17cc650a8f62dee2eb0  https://github.com/KhronosGroup/Vulkan-Headers.git
+glslang  fa9c3deb49e035a8abcabe366f26aac010f6cbfb  https://github.com/KhronosGroup/glslang.git
+spirv-tools  0cfe9e7219148716dfd30b37f4d21753f098707a  https://github.com/KhronosGroup/SPIRV-Tools.git
+spirv-headers  2acb319af38d43be3ea76bfabf3998e5281d8d12  https://github.com/KhronosGroup/SPIRV-Headers.git
+
+# GLib's subprojects that CrossOver's release leaves out, at the commits its
+# wrap files name (proxy-libintl's names tag 0.4). PCRE2 comes through its wrap
+# file, which pins it by hash.
+gvdb  0854af0fdb6d527a8d1999835ac2c5059976c210  https://gitlab.gnome.org/GNOME/gvdb.git
+proxy-libintl  c03e1a74b17fa7ec467e110130775409e4828a4c  https://github.com/frida/proxy-libintl.git
+
+# FFmpeg's decoders for GStreamer (LGPL). CrossOver's release only has a wrap
+# file for it, naming a branch.
+ffmpeg  3b624649725ecdc565c903ca6643d41f33bd49239922e45c9b1442c63dca4e38  https://ffmpeg.org/releases/ffmpeg-6.1.2.tar.xz
+
+# Clang's MinGW toolchain, for the arm64 engine's ARM64EC and arm64 Windows
+# parts, which GCC can't build.
+llvm-mingw  66cbd5178c4a71b0d473e68ede172f8eb7d15d023e67f39201d0a69e21f6bf3c  https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/llvm-mingw-20261104-ucrt-macos-universal.tar.xz
