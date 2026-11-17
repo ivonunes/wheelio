@@ -128,7 +128,8 @@ the app pins. Merge it, then run Release as usual. It stops if `engine/` has cha
 pinned engine was built.
 
 `main` only takes pull requests whose CI passes, with one approving review. The repository's
-admins can merge without the review, but not without CI.
+admins can merge without the review, but not without CI. Deploy keys are let through: Release
+pushes its version commit and tag with the one in the `release` environment.
 
 ## Credits
 
