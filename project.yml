@@ -81,7 +81,7 @@ targets:
       base:
         PRODUCT_NAME: Wheelio
         PRODUCT_BUNDLE_IDENTIFIER: uk.ivonunes.wheelio
-        MARKETING_VERSION: "2.0.0"
+        MARKETING_VERSION: "3.0.0"
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_OBJC_BRIDGING_HEADER: app/Wheelio-Bridging-Header.h
         CODE_SIGN_ENTITLEMENTS: app/Wheelio.entitlements
